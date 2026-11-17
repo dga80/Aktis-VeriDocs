@@ -38,6 +38,11 @@ class VeriDocsDesktopApp(ctk.CTk):
         self.poll_timer_id = None
         self.last_batch_time = None
 
+        # Iniciar escucha automática de inmediato al arrancar si está habilitado en configuración
+        cfg = load_config()
+        if cfg.get("auto_listen_on_startup", True):
+            self.session_manager.start_listening()
+
         self.setup_ui()
         self.check_system_connectivity()
 
@@ -49,7 +54,10 @@ class VeriDocsDesktopApp(ctk.CTk):
 
     def _initial_load_excel(self):
         self.excel_manager.get_orders(force_reload=True)
-        self.after(0, self.check_system_connectivity)
+        try:
+            self.after(0, self.check_system_connectivity)
+        except Exception:
+            pass
 
     def setup_ui(self):
         # Header Frame
@@ -145,20 +153,20 @@ class VeriDocsDesktopApp(ctk.CTk):
         self.current_alert_data = None
 
         # Main Split Content
-        main_content = ctk.CTkFrame(self, fg_color="transparent")
-        main_content.pack(fill="both", expand=True, padx=16, pady=8)
+        self.main_content = ctk.CTkFrame(self, fg_color="transparent")
+        self.main_content.pack(fill="both", expand=True, padx=16, pady=8)
 
-        main_content.grid_columnconfigure(0, weight=4) # Left column
-        main_content.grid_columnconfigure(1, weight=6) # Right column
-        main_content.grid_rowconfigure(0, weight=1)
+        self.main_content.grid_columnconfigure(0, weight=4) # Left column
+        self.main_content.grid_columnconfigure(1, weight=6) # Right column
+        self.main_content.grid_rowconfigure(0, weight=1)
 
         # Left Column (Controls, Catalog & Aktis Query)
-        left_col = ctk.CTkFrame(main_content)
+        left_col = ctk.CTkFrame(self.main_content)
         left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         self.setup_left_column(left_col)
 
         # Right Column (Latest Batch Results & Realtime Monitor)
-        right_col = ctk.CTkFrame(main_content)
+        right_col = ctk.CTkFrame(self.main_content)
         right_col.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
         self.setup_right_column(right_col)
 
@@ -178,10 +186,11 @@ class VeriDocsDesktopApp(ctk.CTk):
             font=ctk.CTkFont(size=15, weight="bold")
         ).pack(side="left")
 
+        is_active = self.session_manager.active
         self.lbl_session_badge = ctk.CTkLabel(
             m_header,
-            text="INACTIVO",
-            fg_color="gray30",
+            text="ESCUCHANDO BANDEJA" if is_active else "INACTIVO",
+            fg_color="#10b981" if is_active else "gray30",
             corner_radius=10,
             padx=10,
             font=ctk.CTkFont(size=11, weight="bold")
@@ -190,10 +199,10 @@ class VeriDocsDesktopApp(ctk.CTk):
 
         self.btn_toggle_listen = ctk.CTkButton(
             card_monitor,
-            text="▶ INICIAR ESCUCHA AUTOMÁTICA",
+            text="⏹ DETENER ESCUCHA" if is_active else "▶ INICIAR ESCUCHA AUTOMÁTICA",
             height=44,
-            fg_color="#059669",
-            hover_color="#047857",
+            fg_color="#ef4444" if is_active else "#059669",
+            hover_color="#dc2626" if is_active else "#047857",
             text_color="#ffffff",
             font=ctk.CTkFont(size=14, weight="bold"),
             command=self.toggle_listening
@@ -391,19 +400,38 @@ class VeriDocsDesktopApp(ctk.CTk):
 
         self.lbl_batch_sub = ctk.CTkLabel(
             self.last_batch_card,
-            text="Inicia la escucha automática o procesa un archivo para ver aquí los documentos divididos.",
+            text="Escucha automática activa. Al colocar un escaneo en la bandeja, se procesará automáticamente.",
             font=ctk.CTkFont(size=12),
             text_color="gray",
             justify="left"
         )
         self.lbl_batch_sub.pack(anchor="w", padx=12, pady=(0, 8))
 
+        # Panel de Progreso en Vivo (visible mientras se procesa un escaneo)
+        self.progress_frame = ctk.CTkFrame(parent, fg_color=("#dbeafe", "#1e3a5f"), corner_radius=6)
+        # Not packed initially
+
+        self.lbl_progress_text = ctk.CTkLabel(
+            self.progress_frame,
+            text="⚙️ Procesando escaneo...",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color=("#1e40af", "#93c5fd"),
+            anchor="w",
+            justify="left"
+        )
+        self.lbl_progress_text.pack(fill="x", padx=12, pady=(8, 4))
+
+        self.progress_bar = ctk.CTkProgressBar(self.progress_frame, height=10, corner_radius=5)
+        self.progress_bar.pack(fill="x", padx=12, pady=(0, 10))
+        self.progress_bar.set(0)
+
         # Scrollable de Archivos Generados
-        ctk.CTkLabel(
+        self.lbl_files_header = ctk.CTkLabel(
             parent,
             text="Documentos PDF Generados del Lote:",
             font=ctk.CTkFont(size=12, weight="bold")
-        ).pack(anchor="w", padx=14, pady=(4, 2))
+        )
+        self.lbl_files_header.pack(anchor="w", padx=14, pady=(4, 2))
 
         self.files_scroll = ctk.CTkScrollableFrame(parent, height=260)
         self.files_scroll.pack(fill="both", expand=True, padx=12, pady=(0, 6))
@@ -450,13 +478,37 @@ class VeriDocsDesktopApp(ctk.CTk):
             return
 
         def _worker():
-            self.session_manager.log(f"Iniciando procesamiento manual de: '{os.path.basename(file_path)}'...")
+            fname = os.path.basename(file_path)
+            self.session_manager.log(f"Iniciando procesamiento manual de: '{fname}'...")
+            self.session_manager.update_progress(
+                is_processing=True,
+                filename=fname,
+                phase="Iniciando análisis manual...",
+                current_page=0,
+                total_pages=0,
+                created_files=[]
+            )
+
+            def _on_prog(pdata):
+                self.session_manager.update_progress(
+                    is_processing=True,
+                    filename=fname,
+                    of=pdata.get("of", ""),
+                    phase=pdata.get("phase", ""),
+                    current_page=pdata.get("current_page", 0),
+                    total_pages=pdata.get("total_pages", 0),
+                    created_files=pdata.get("created_files", [])
+                )
+
             res = process_scanned_pdf(
                 pdf_path=file_path,
                 excel_manager=self.excel_manager,
                 catalog=self.catalog,
-                log_callback=self.session_manager.log
+                log_callback=self.session_manager.log,
+                progress_callback=_on_prog
             )
+            self.session_manager.update_progress(is_processing=False)
+
             if res["success"]:
                 self.session_manager.last_batch = res
                 self.session_manager.batches_history.append({
@@ -489,113 +541,172 @@ class VeriDocsDesktopApp(ctk.CTk):
         threading.Thread(target=_worker, daemon=True).start()
 
     def poll_session_status(self):
-        status = self.session_manager.get_status()
+        try:
+            status = self.session_manager.get_status()
 
-        # Actualizar botón según estado real
-        if status["active"]:
-            self.lbl_session_badge.configure(text="ESCUCHANDO BANDEJA", fg_color="#10b981")
-            self.btn_toggle_listen.configure(
-                text="⏹ DETENER ESCUCHA",
-                fg_color="#ef4444",
-                hover_color="#dc2626"
-            )
-        else:
-            self.lbl_session_badge.configure(text="INACTIVO", fg_color="gray30")
-            self.btn_toggle_listen.configure(
-                text="▶ INICIAR ESCUCHA AUTOMÁTICA",
-                fg_color="#10b981",
-                hover_color="#059669"
-            )
-
-        self.lbl_batch_counter.configure(text=f"Lotes procesados: {status['total_batches_processed']}")
-
-        # Manejar alertas activas
-        active_alerts = status.get("active_alerts", [])
-        if active_alerts:
-            latest_alert = active_alerts[-1]
-            self.current_alert_data = latest_alert
-            self.lbl_alert_msg.configure(text=f"{latest_alert['title']}: {latest_alert['message']}")
-            if not self.alert_frame.winfo_ismapped():
-                self.alert_frame.pack(fill="x", padx=16, pady=(0, 6), before=self.children["!ctkframe2"])
-        else:
-            if self.alert_frame.winfo_ismapped():
-                self.alert_frame.pack_forget()
-
-        # Renderizar último lote procesado si ha cambiado
-        last_b = status.get("last_batch")
-        if last_b:
-            of_str = last_b.get("of", "")
-            o_info = last_b.get("order_info", {})
-            col_e = o_info.get("pedido_odoo", "")
-            col_i = o_info.get("descripcion", "")
-            dest_dir = last_b.get("destination_dir", "")
-
-            title_text = f"OF: {of_str}  |  Odoo: {col_e or '(N/A)'}  |  Total: {last_b.get('total_pages', 0)} páginas"
-            self.lbl_batch_title.configure(text=title_text)
-            self.lbl_batch_sub.configure(
-                text=f"Descripción: {col_i or '(Sin descripción)'}\nCarpeta: {dest_dir}"
-            )
-            self.btn_open_batch_folder.configure(
-                state="normal",
-                fg_color="#059669",
-                hover_color="#047857",
-                text_color="#ffffff"
-            )
-
-            # Renderizar archivos creados si es la primera vez que vemos este lote
-            created_files = last_b.get("created_files", [])
-            # Recrear lista si los archivos no coinciden
-            current_widgets = len(self.files_scroll.winfo_children())
-            if current_widgets != len(created_files):
-                for w in self.files_scroll.winfo_children():
-                    w.destroy()
-
-                for f in created_files:
-                    is_warn = f.get("is_warning", False)
-                    card_bg = ("#fee2e2", "#450a0a") if is_warn else ("gray90", "gray19")
-                    card = ctk.CTkFrame(self.files_scroll, fg_color=card_bg, height=42)
-                    card.pack(fill="x", pady=2, padx=2)
-
-                    icon = "⚠️ " if is_warn else "📄 "
-                    pages_tag = f"  [Págs: {f.get('pages_list', [])}]"
-                    doc_lbl = ctk.CTkLabel(
-                        card,
-                        text=f"{icon}{f.get('doc_name', '')}{pages_tag}",
-                        font=ctk.CTkFont(weight="bold", size=12),
-                        text_color="#ef4444" if is_warn else ("black", "white")
-                    )
-                    doc_lbl.pack(anchor="w", padx=8, pady=(3, 0))
-
-                    file_lbl = ctk.CTkLabel(
-                        card,
-                        text=f.get("filename", ""),
-                        font=ctk.CTkFont(family="Consolas", size=10),
-                        text_color="gray"
-                    )
-                    file_lbl.pack(anchor="w", padx=8, pady=(0, 3))
-
-        # Renderizar últimos logs
-        logs = status.get("events_log", [])
-        if len(self.log_scroll.winfo_children()) != len(logs):
-            for w in self.log_scroll.winfo_children():
-                w.destroy()
-            for entry in logs:
-                t = entry.get("time", "")
-                m = entry.get("message", "")
-                lvl = entry.get("level", "info")
-
-                color = "#10b981" if lvl == "success" else ("#f59e0b" if lvl == "warning" else ("#ef4444" if lvl == "error" else "gray"))
-                row = ctk.CTkLabel(
-                    self.log_scroll,
-                    text=f"[{t}] {m}",
-                    font=ctk.CTkFont(family="Consolas", size=10),
-                    text_color=color,
-                    anchor="w"
+            # Actualizar botón según estado real
+            if status["active"]:
+                self.lbl_session_badge.configure(text="ESCUCHANDO BANDEJA", fg_color="#10b981")
+                self.btn_toggle_listen.configure(
+                    text="⏹ DETENER ESCUCHA",
+                    fg_color="#ef4444",
+                    hover_color="#dc2626",
+                    text_color="#ffffff"
                 )
-                row.pack(fill="x", pady=1, padx=4)
+            else:
+                self.lbl_session_badge.configure(text="INACTIVO", fg_color="gray30")
+                self.btn_toggle_listen.configure(
+                    text="▶ INICIAR ESCUCHA AUTOMÁTICA",
+                    fg_color="#059669",
+                    hover_color="#047857",
+                    text_color="#ffffff"
+                )
 
-        # Reprogramar siguiente comprobación
-        self.after(1000, self.poll_session_status)
+            self.lbl_batch_counter.configure(text=f"Lotes procesados: {status['total_batches_processed']}")
+
+            # Manejar alertas activas
+            active_alerts = status.get("active_alerts", [])
+            if active_alerts:
+                latest_alert = active_alerts[-1]
+                self.current_alert_data = latest_alert
+                self.lbl_alert_msg.configure(text=f"{latest_alert['title']}: {latest_alert['message']}")
+                if not self.alert_frame.winfo_ismapped():
+                    self.alert_frame.pack(fill="x", padx=16, pady=(0, 6), before=self.main_content)
+            else:
+                if self.alert_frame.winfo_ismapped():
+                    self.alert_frame.pack_forget()
+
+            # Progreso en tiempo real si hay un escaneo en curso
+            curr_prog = status.get("current_progress", {})
+            is_proc = curr_prog.get("is_processing", False)
+
+            if is_proc:
+                if not self.progress_frame.winfo_ismapped():
+                    self.progress_frame.pack(fill="x", padx=12, pady=(0, 6), before=self.lbl_files_header)
+
+                p_file = curr_prog.get("filename", "")
+                p_of = curr_prog.get("of", "")
+                p_phase = curr_prog.get("phase", "")
+                c_p = curr_prog.get("current_page", 0)
+                t_p = max(1, curr_prog.get("total_pages", 1))
+
+                of_tag = f"  |  OF: {p_of}" if p_of else ""
+                self.lbl_progress_text.configure(
+                    text=f"⚙️ Procesando: {p_file}{of_tag}\n   {p_phase}"
+                )
+                self.progress_bar.set(min(1.0, c_p / float(t_p)))
+
+                # Renderizar los archivos creados EN DIRECTO a medida que se van generando
+                live_files = curr_prog.get("created_files", [])
+                current_widgets = len(self.files_scroll.winfo_children())
+                if current_widgets != len(live_files):
+                    for w in self.files_scroll.winfo_children():
+                        w.destroy()
+
+                    for f in live_files:
+                        is_warn = f.get("is_warning", False)
+                        card_bg = ("#fee2e2", "#450a0a") if is_warn else ("gray90", "gray19")
+                        card = ctk.CTkFrame(self.files_scroll, fg_color=card_bg, height=42)
+                        card.pack(fill="x", pady=2, padx=2)
+
+                        icon = "⚠️ " if is_warn else "📄 "
+                        pages_tag = f"  [Págs: {f.get('pages_list', [])}]"
+                        doc_lbl = ctk.CTkLabel(
+                            card,
+                            text=f"{icon}{f.get('doc_name', '')}{pages_tag}",
+                            font=ctk.CTkFont(weight="bold", size=12),
+                            text_color="#ef4444" if is_warn else ("black", "white")
+                        )
+                        doc_lbl.pack(anchor="w", padx=8, pady=(3, 0))
+
+                        file_lbl = ctk.CTkLabel(
+                            card,
+                            text=f.get("filename", ""),
+                            font=ctk.CTkFont(family="Consolas", size=10),
+                            text_color="gray"
+                        )
+                        file_lbl.pack(anchor="w", padx=8, pady=(0, 3))
+            else:
+                if self.progress_frame.winfo_ismapped():
+                    self.progress_frame.pack_forget()
+
+                # Renderizar último lote procesado si ha cambiado
+                last_b = status.get("last_batch")
+                if last_b:
+                    of_str = last_b.get("of", "")
+                    o_info = last_b.get("order_info", {})
+                    col_e = o_info.get("pedido_odoo", "")
+                    col_i = o_info.get("descripcion", "")
+                    dest_dir = last_b.get("destination_dir", "")
+
+                    title_text = f"OF: {of_str}  |  Odoo: {col_e or '(N/A)'}  |  Total: {last_b.get('total_pages', 0)} páginas"
+                    self.lbl_batch_title.configure(text=title_text)
+                    self.lbl_batch_sub.configure(
+                        text=f"Descripción: {col_i or '(Sin descripción)'}\nCarpeta: {dest_dir}"
+                    )
+                    self.btn_open_batch_folder.configure(
+                        state="normal",
+                        fg_color="#059669",
+                        hover_color="#047857",
+                        text_color="#ffffff"
+                    )
+
+                    # Renderizar archivos creados si es la primera vez que vemos este lote
+                    created_files = last_b.get("created_files", [])
+                    current_widgets = len(self.files_scroll.winfo_children())
+                    if current_widgets != len(created_files):
+                        for w in self.files_scroll.winfo_children():
+                            w.destroy()
+
+                        for f in created_files:
+                            is_warn = f.get("is_warning", False)
+                            card_bg = ("#fee2e2", "#450a0a") if is_warn else ("gray90", "gray19")
+                            card = ctk.CTkFrame(self.files_scroll, fg_color=card_bg, height=42)
+                            card.pack(fill="x", pady=2, padx=2)
+
+                            icon = "⚠️ " if is_warn else "📄 "
+                            pages_tag = f"  [Págs: {f.get('pages_list', [])}]"
+                            doc_lbl = ctk.CTkLabel(
+                                card,
+                                text=f"{icon}{f.get('doc_name', '')}{pages_tag}",
+                                font=ctk.CTkFont(weight="bold", size=12),
+                                text_color="#ef4444" if is_warn else ("black", "white")
+                            )
+                            doc_lbl.pack(anchor="w", padx=8, pady=(3, 0))
+
+                            file_lbl = ctk.CTkLabel(
+                                card,
+                                text=f.get("filename", ""),
+                                font=ctk.CTkFont(family="Consolas", size=10),
+                                text_color="gray"
+                            )
+                            file_lbl.pack(anchor="w", padx=8, pady=(0, 3))
+
+            # Renderizar últimos logs
+            logs = status.get("events_log", [])
+            if len(self.log_scroll.winfo_children()) != len(logs):
+                for w in self.log_scroll.winfo_children():
+                    w.destroy()
+                for entry in logs:
+                    t = entry.get("time", "")
+                    m = entry.get("message", "")
+                    lvl = entry.get("level", "info")
+
+                    color = "#10b981" if lvl == "success" else ("#f59e0b" if lvl == "warning" else ("#ef4444" if lvl == "error" else "gray"))
+                    row = ctk.CTkLabel(
+                        self.log_scroll,
+                        text=f"[{t}] {m}",
+                        font=ctk.CTkFont(family="Consolas", size=10),
+                        text_color=color,
+                        anchor="w"
+                    )
+                    row.pack(fill="x", pady=1, padx=4)
+
+        except Exception as e:
+            print(f"[poll_session_status] Error: {e}")
+        finally:
+            # Reprogramar siguiente comprobación de forma garantizada
+            self.after(1000, self.poll_session_status)
 
     def dismiss_current_alert(self):
         if self.current_alert_data:

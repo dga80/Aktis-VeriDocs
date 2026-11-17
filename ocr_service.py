@@ -135,6 +135,67 @@ def extract_text_from_image(img: Image.Image, lang: str = "es-ES") -> Dict[str, 
         return {"success": False, "error": str(e), "text": "", "lines": []}
 
 
+def is_page_blank(
+    pdf_input: Union[str, Any],
+    page_index: int = 0,
+    dark_pixel_threshold: int = 220,
+    max_dark_ratio: float = 0.0025
+) -> bool:
+    """
+    Determina si una página escaneada está prácticamente en blanco (típico reverso dúplex).
+    Primero comprueba texto embebido nativo; si no hay, renderiza a 72 DPI y evalúa
+    la proporción de píxeles oscuros (< 0.25% se considera hoja en blanco).
+    """
+    if not PDFIUM_AVAILABLE:
+        return False
+
+    close_doc_at_end = False
+    doc = None
+    try:
+        if isinstance(pdf_input, str):
+            doc = pdfium.PdfDocument(pdf_input)
+            close_doc_at_end = True
+        else:
+            doc = pdf_input
+
+        if page_index < 0 or page_index >= len(doc):
+            return False
+
+        page = doc[page_index]
+        # 1. Comprobar texto vectorial nativo
+        try:
+            tp = page.get_textpage()
+            txt = tp.get_text_range().strip()
+            if len(txt) > 25:
+                return False
+        except Exception:
+            pass
+
+        # 2. Renderizado ultrarrápido a escala 1.0 (72 DPI)
+        bitmap = page.render(scale=1.0)
+        pil_img = bitmap.to_pil()
+        gray = pil_img.convert("L")
+
+        import numpy as np
+        arr = np.array(gray)
+        dark_pixels = np.count_nonzero(arr < dark_pixel_threshold)
+        total_pixels = arr.size
+        if total_pixels == 0:
+            return True
+
+        ratio = dark_pixels / total_pixels
+        return ratio < max_dark_ratio
+    except Exception as e:
+        print(f"[ocr_service] Error comprobando página en blanco (pág {page_index}): {e}")
+        return False
+    finally:
+        if close_doc_at_end and doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
+
+
 def extract_header_text(
     pdf_input: Union[str, Any],
     page_index: int = 0,
@@ -291,12 +352,16 @@ def match_footer_code(ocr_text: str, candidates: List[Dict[str, Any]]) -> Tuple[
         if len(compact_code) >= 4 and compact_code in compact_text:
             return item, raw_code
 
-        # 4. En anexos complejos (ej: ANEXO 1_IT0001), permitir coincidencia con 'ANEXO 1' o 'IT0001'
+        # 4. En anexos complejos (ej: ANEXO 1_IT0001), permitir coincidencia con 'ANEXO 1', 'IT0001' o descripción
         if "ANEXO" in raw_code:
             parts = raw_code.split('_')
             for part in parts:
                 if len(part) >= 4 and re.search(rf'(?<![A-Z0-9]){re.escape(part)}(?![A-Z0-9])', clean_text):
                     return item, raw_code
+            if "1" in raw_code and "ANEXO" in clean_text and ("VERIFICA" in clean_text or "TAREAS" in clean_text):
+                return item, raw_code
+            if "2" in raw_code and ("CHECK" in clean_text or "MCD" in clean_text):
+                return item, raw_code
 
     return None, None
 

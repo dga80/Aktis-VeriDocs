@@ -12,6 +12,7 @@ import pypdfium2 as pdfium
 from config import load_config
 from ocr_service import (
     is_ocr_available,
+    is_page_blank,
     extract_of_from_header,
     extract_footer_text,
     match_footer_code
@@ -317,7 +318,8 @@ def process_scanned_pdf(
     pdf_path: str,
     excel_manager: ExcelManager,
     catalog: Optional[List[Dict[str, Any]]] = None,
-    log_callback: Optional[Callable[[str, str], None]] = None
+    log_callback: Optional[Callable[[str, str], None]] = None,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None
 ) -> Dict[str, Any]:
     """
     Motor central del nuevo flujo de VeriDocs:
@@ -329,11 +331,26 @@ def process_scanned_pdf(
     6. Guarda páginas no reconocidas en un PDF de revisión y genera alerta.
     7. Guarda todo en la carpeta destino de la OF y archiva el PDF original escaneado.
     """
+    created_files = []
+
     def log(msg: str, level: str = "info"):
         if log_callback:
             log_callback(msg, level)
         else:
             print(f"[{level.upper()}] {msg}")
+
+    def notify_prog(phase: str, cur_p: int = 0, tot_p: int = 0, of_val: str = ""):
+        if progress_callback:
+            try:
+                progress_callback({
+                    "phase": phase,
+                    "current_page": cur_p,
+                    "total_pages": tot_p,
+                    "of": of_val,
+                    "created_files": list(created_files)
+                })
+            except Exception:
+                pass
 
     cfg = load_config()
     header_pct = int(cfg.get("ocr_header_height_percent", 30))
@@ -363,6 +380,7 @@ def process_scanned_pdf(
         return {"success": False, "error": "El documento PDF está vacío (0 páginas)."}
 
     log(f"Documento cargado correctamente con {total_pages} páginas.")
+    notify_prog("Leyendo cabecera (pág 1) para detectar OF...", 0, total_pages)
 
     # 2. OCR de la Cabecera de la Página 1 para detectar la OF
     log(f"🔍 Leyendo cabecera (primeros {header_pct}%) de la página 1...")
@@ -383,6 +401,7 @@ def process_scanned_pdf(
         }
 
     log(f"✅ OF detectada en cabecera: '{best_of}'", "success")
+    notify_prog(f"OF: {best_of}. Consultando pedidos en Aktis...", 1, total_pages, of_val=best_of)
 
     # 3. Buscar la OF en el Excel de Aktis
     order_info = None
@@ -432,6 +451,7 @@ def process_scanned_pdf(
     page_classifications = []
 
     for p_idx in range(total_pages):
+        notify_prog(f"Analizando pie pág {p_idx + 1} de {total_pages}...", p_idx + 1, total_pages, of_val=of_str)
         res_footer = extract_footer_text(src_doc, page_index=p_idx, footer_height_percent=footer_pct, lang=ocr_lang)
         matched_doc, matched_code = match_footer_code(res_footer.get("text", ""), catalog)
 
@@ -439,7 +459,12 @@ def process_scanned_pdf(
             doc_name = matched_doc.get("documento", matched_code)
             log(f"  Pág {p_idx + 1}/{total_pages}: Código '{matched_code}' -> '{doc_name}'")
         else:
-            log(f"  Pág {p_idx + 1}/{total_pages}: ⚠️ Sin código reconocido.", "warning")
+            # Comprobar si es reverso en blanco de escáner dúplex
+            if is_page_blank(src_doc, page_index=p_idx):
+                log(f"  Pág {p_idx + 1}/{total_pages}: Hoja en blanco detectada (reverso dúplex). Se omite automáticamente.")
+                matched_code = "BLANK"
+            else:
+                log(f"  Pág {p_idx + 1}/{total_pages}: ⚠️ Sin código reconocido.", "warning")
 
         page_classifications.append({
             "page_idx": p_idx,
@@ -458,6 +483,9 @@ def process_scanned_pdf(
         doc_def = item["doc_def"]
         code = item["code"]
 
+        if code == "BLANK":
+            continue
+
         if doc_def and code:
             if code not in groups:
                 groups[code] = {
@@ -469,7 +497,8 @@ def process_scanned_pdf(
             unrecognized_pages.append(p_idx)
 
     # 7. Generación de los archivos PDF divididos
-    created_files = []
+    escaneos_root = cfg.get("escaneos_folder") or dest_base
+    inc_folder = os.path.join(escaneos_root, "Incidencias")
 
     for code, g in groups.items():
         doc_def = g["doc_def"]
@@ -501,6 +530,15 @@ def process_scanned_pdf(
                 sub_doc.save(out_path)
                 sub_doc.close()
 
+                # Duplicar copia en la carpeta general de incidencias
+                try:
+                    os.makedirs(inc_folder, exist_ok=True)
+                    inc_dest = os.path.join(inc_folder, os.path.basename(out_path))
+                    shutil.copy2(out_path, inc_dest)
+                    log(f"  📋 Copia duplicada en carpeta 'Incidencias': '{os.path.basename(inc_dest)}'")
+                except Exception as e_copy_inc:
+                    log(f"  ⚠️ No se pudo copiar en Incidencias: {e_copy_inc}", "warning")
+
                 created_files.append({
                     "code": code,
                     "doc_name": f"{doc_name} ({k}-{total_inc})",
@@ -510,6 +548,7 @@ def process_scanned_pdf(
                     "pages_list": [p + 1]
                 })
                 log(f"  📄 Creado: '{os.path.basename(out_path)}' (Pág {p + 1})")
+                notify_prog(f"Generado: {os.path.basename(out_path)}", total_pages, total_pages, of_val=of_str)
         else:
             # Documento normal: agrupar todas las páginas en un único PDF
             parts = [doc_name]
@@ -530,6 +569,16 @@ def process_scanned_pdf(
             sub_doc.save(out_path)
             sub_doc.close()
 
+            # Si es incidencia (aunque tenga 1 sola hoja), duplicar también en la carpeta de incidencias
+            if is_inc:
+                try:
+                    os.makedirs(inc_folder, exist_ok=True)
+                    inc_dest = os.path.join(inc_folder, os.path.basename(out_path))
+                    shutil.copy2(out_path, inc_dest)
+                    log(f"  📋 Copia duplicada en carpeta 'Incidencias': '{os.path.basename(inc_dest)}'")
+                except Exception as e_copy_inc:
+                    log(f"  ⚠️ No se pudo copiar en Incidencias: {e_copy_inc}", "warning")
+
             pages_human = [p + 1 for p in pages]
             created_files.append({
                 "code": code,
@@ -540,6 +589,7 @@ def process_scanned_pdf(
                 "pages_list": pages_human
             })
             log(f"  📄 Creado: '{os.path.basename(out_path)}' ({len(pages)} págs: {pages_human})")
+            notify_prog(f"Generado: {os.path.basename(out_path)}", total_pages, total_pages, of_val=of_str)
 
     # Páginas no reconocidas
     alert_unrecognized = None
@@ -623,8 +673,29 @@ class ScanningSession:
         self.batches_history = []
         self.active_alerts = []
         self.current_processing_file = None
+        self.current_progress = {
+            "is_processing": False,
+            "filename": "",
+            "of": "",
+            "phase": "",
+            "current_page": 0,
+            "total_pages": 0,
+            "created_files": []
+        }
         self.last_batch = None
         self.processed_files_set = set()
+
+    def update_progress(self, is_processing: bool, filename: str = "", of: str = "", phase: str = "", current_page: int = 0, total_pages: int = 0, created_files: list = None):
+        with self.lock:
+            self.current_progress = {
+                "is_processing": is_processing,
+                "filename": filename,
+                "of": of,
+                "phase": phase,
+                "current_page": current_page,
+                "total_pages": total_pages,
+                "created_files": list(created_files) if created_files else []
+            }
 
     def log(self, message: str, level: str = "info"):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -688,6 +759,7 @@ class ScanningSession:
             return {
                 "active": self.active,
                 "current_processing_file": self.current_processing_file,
+                "current_progress": dict(self.current_progress),
                 "last_batch": self.last_batch,
                 "batches_history": self.batches_history[-20:], # Últimos 20 lotes
                 "active_alerts": list(self.active_alerts),
@@ -733,15 +805,36 @@ class ScanningSession:
                         continue
 
                     self.current_processing_file = fname
+                    self.update_progress(
+                        is_processing=True,
+                        filename=fname,
+                        phase="Nuevo escaneo detectado. Preparando análisis...",
+                        current_page=0,
+                        total_pages=0,
+                        created_files=[]
+                    )
                     self.log(f"📥 Nuevo PDF detectado en bandeja: '{fname}'. Procesando lote...")
+
+                    def _on_prog(pdata):
+                        self.update_progress(
+                            is_processing=True,
+                            filename=fname,
+                            of=pdata.get("of", ""),
+                            phase=pdata.get("phase", ""),
+                            current_page=pdata.get("current_page", 0),
+                            total_pages=pdata.get("total_pages", 0),
+                            created_files=pdata.get("created_files", [])
+                        )
 
                     batch_res = process_scanned_pdf(
                         pdf_path=fpath,
                         excel_manager=self.excel_manager,
                         catalog=catalog,
-                        log_callback=self.log
+                        log_callback=self.log,
+                        progress_callback=_on_prog
                     )
 
+                    self.update_progress(is_processing=False)
                     self.processed_files_set.add(fpath)
                     self.current_processing_file = None
 
