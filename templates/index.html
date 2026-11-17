@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VeriDocs - Gestión y Renombrado Automático de Escaneos MES</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="header-left">
+        <div class="logo-badge">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+            <polyline points="14 2 14 8 20 8"></polyline>
+            <line x1="16" y1="13" x2="8" y2="13"></line>
+            <line x1="16" y1="17" x2="8" y2="17"></line>
+            <polyline points="10 9 9 9 8 9"></polyline>
+          </svg>
+        </div>
+        <div>
+          <h1>VeriDocs</h1>
+          <p class="subtitle">Clasificación y troceado automático de dossiers por OF</p>
+        </div>
+      </div>
+      <div class="header-right">
+        <div class="status-pill" id="excel-status-pill" title="Estado de conexión con Excel">
+          <span class="status-dot dot-yellow"></span>
+          <span class="status-label">Excel: Conectando...</span>
+        </div>
+        <div class="status-pill" id="folder-status-pill" title="Estado de carpeta de escaneos">
+          <span class="status-dot dot-yellow"></span>
+          <span class="status-label">Escaneos: Conectando...</span>
+        </div>
+        <div class="status-pill" id="ocr-status-pill" title="Motor OCR Nativo de Windows (Windows.Media.Ocr)">
+          <span class="status-dot dot-yellow"></span>
+          <span class="status-label">OCR: Iniciando...</span>
+        </div>
+        <button id="btn-open-settings" class="btn-settings-header" title="Abrir Configuración de Rutas y OCR">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"></circle>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          </svg>
+          <span>Configuración</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Alert Banner (Visible when active alert exists) -->
+    <div id="active-alert-banner" class="alert-banner" style="display: none;">
+      <span class="alert-icon">⚠️</span>
+      <div class="alert-content">
+        <strong id="alert-title">Atención en Escaneo</strong>
+        <p id="alert-message">-</p>
+      </div>
+      <div class="alert-actions">
+        <button id="btn-alert-open-folder" class="btn btn-warning btn-sm">📂 Abrir Carpeta</button>
+        <button id="btn-alert-dismiss" class="btn btn-ghost btn-sm">✕ Descartar</button>
+      </div>
+    </div>
+
+    <!-- Main Content -->
+    <main class="app-main">
+      <!-- Left Column: Controls & Catalog -->
+      <div class="column-left">
+        
+        <!-- Step 1: Monitor / Escucha Card -->
+        <section class="card">
+          <div class="card-header">
+            <span class="step-badge">1</span>
+            <h2>Escucha Automática en Directo</h2>
+            <span id="session-status-badge" class="badge badge-inactive">INACTIVO</span>
+          </div>
+
+          <div style="padding: 10px 0;">
+            <button id="btn-toggle-watcher" class="btn btn-success btn-large" style="width: 100%;">
+              <span class="icon">▶</span> INICIAR ESCUCHA AUTOMÁTICA
+            </button>
+            <p class="form-text" style="margin-top: 8px;">
+              ● Al escanear un taco de hojas, VeriDocs leerá la OF de la pág. 1, consultará Aktis, clasificará y troceará según <code>codigosOCR.xlsx</code>.
+            </p>
+
+            <div style="margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--border-color);">
+              <label for="manual-pdf-upload" class="btn btn-secondary btn-sm" style="width: 100%; display: block; text-align: center; cursor: pointer;">
+                📄 Subir y Procesar Archivo PDF Manualmente...
+              </label>
+              <input type="file" id="manual-pdf-upload" accept=".pdf" style="display: none;">
+            </div>
+          </div>
+        </section>
+
+        <!-- Step 2: Catalog Card (codigosOCR.xlsx) -->
+        <section class="card">
+          <div class="card-header">
+            <span class="step-badge">2</span>
+            <h2>Catálogo Oficial (<span id="catalog-count">0</span> tipos)</h2>
+            <button id="btn-reload-catalog" class="btn-sm btn-ghost" title="Recargar catálogo desde codigosOCR.xlsx">↻ Recargar</button>
+          </div>
+          <div id="catalog-list" class="doc-list" style="max-height: 240px; overflow-y: auto;">
+            <!-- Populated via JS -->
+          </div>
+        </section>
+
+        <!-- Step 3: Consulta en Aktis (Opcional) -->
+        <section class="card">
+          <div class="card-header">
+            <span class="step-badge">3</span>
+            <h2>Consulta en Aktis (Opcional)</h2>
+            <button id="btn-reload-excel" class="btn-sm btn-ghost" title="Recargar listado desde Excel">↻ Recargar</button>
+          </div>
+          
+          <div class="form-group search-container">
+            <div class="input-wrapper">
+              <input type="text" id="of-input" placeholder="Buscar OF (ej: AYC/MO/00560 o 560)" autocomplete="off">
+              <button id="btn-clear-of" class="btn-clear" style="display:none;">✕</button>
+            </div>
+            <div id="autocomplete-list" class="autocomplete-dropdown"></div>
+          </div>
+
+          <div id="order-details-card" class="order-details-box" style="display: none;">
+            <div class="order-details-grid">
+              <div class="detail-item">
+                <span class="detail-label">N.º OF:</span>
+                <span class="detail-value highlight-of" id="info-of">-</span>
+              </div>
+              <div class="detail-item">
+                <span class="detail-label">Pedido ODOO:</span>
+                <span class="detail-value" id="info-pedido-odoo">-</span>
+              </div>
+              <div class="detail-item full-width">
+                <span class="detail-label">Descripción:</span>
+                <span class="detail-value" id="info-desc">-</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+      </div>
+
+      <!-- Right Column: Batch Results & Realtime Progress -->
+      <div class="column-right">
+
+        <!-- Last Batch Result Card -->
+        <section class="card card-monitor">
+          <div class="card-header">
+            <h2>Monitor de Dossiers y Documentos Generados</h2>
+            <span id="batch-counter-badge" class="badge badge-info">Lotes hoy: 0</span>
+          </div>
+
+          <div class="batch-card" id="last-batch-container">
+            <div class="batch-card-header">
+              <div>
+                <div class="batch-title" id="last-batch-title">Esperando escaneos...</div>
+                <div class="batch-meta" id="last-batch-meta">Inicia la escucha automática o sube un PDF para ver aquí el resultado.</div>
+              </div>
+              <button id="btn-open-batch-folder" class="btn btn-success btn-sm" style="display: none;">
+                📂 Abrir Carpeta de la OF
+              </button>
+            </div>
+
+            <div id="generated-files-section" style="margin-top: 14px; display: none;">
+              <h4 style="font-size: 0.9rem; margin-bottom: 8px;">Documentos PDF divididos y archivados:</h4>
+              <div id="generated-files-list"></div>
+            </div>
+          </div>
+
+          <!-- Live Activity Log -->
+          <div class="log-section">
+            <div class="log-header" id="btn-toggle-log">
+              <span>Registro de Actividad en Directo</span>
+              <span id="log-toggle-icon">▼</span>
+            </div>
+            <div id="events-log-container" class="log-container">
+              <div class="log-entry log-info">[Listo] Monitor preparado.</div>
+            </div>
+          </div>
+        </section>
+
+      </div>
+    </main>
+
+    <!-- Settings Modal -->
+    <div id="settings-modal" class="modal-backdrop" style="display: none;">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3>Configuración de VeriDocs</h3>
+          <button id="btn-close-settings" class="btn-clear">✕</button>
+        </div>
+
+        <div class="modal-tabs">
+          <button class="tab-btn active" data-tab="tab-paths">📁 Rutas de Red</button>
+          <button class="tab-btn" data-tab="tab-ocr">🔍 Parámetros OCR</button>
+        </div>
+
+        <div class="modal-body">
+          <!-- Tab 1: Rutas y Red -->
+          <div id="tab-paths" class="tab-content active">
+            <div class="form-group">
+              <label for="cfg-excel-path">Ruta del archivo Excel (LISTADO PEDIDOS EN CURSO):</label>
+              <input type="text" id="cfg-excel-path" class="form-control">
+            </div>
+            <div class="form-group">
+              <label for="cfg-escaneos-folder">Carpeta donde caen los PDFs del escáner:</label>
+              <input type="text" id="cfg-escaneos-folder" class="form-control">
+            </div>
+            <div class="form-group">
+              <label for="cfg-dest-folder">Carpeta base donde se creará la carpeta de la OF:</label>
+              <input type="text" id="cfg-dest-folder" class="form-control">
+            </div>
+            <div class="network-info-box">
+              <p><strong>IP del Servidor en la Red:</strong> <span id="cfg-server-ip">-</span></p>
+              <p><strong>Puerto:</strong> <span id="cfg-server-port">5055</span></p>
+            </div>
+          </div>
+
+          <!-- Tab 2: OCR -->
+          <div id="tab-ocr" class="tab-content">
+            <div class="toggle-switch-row">
+              <div>
+                <strong>Reconocimiento automático OCR (Windows.Media.Ocr)</strong>
+                <p class="form-text">Lee la cabecera en la pág 1 para la OF y el pie de página de cada hoja para clasificar.</p>
+              </div>
+              <input type="checkbox" id="cfg-ocr-enabled" style="transform: scale(1.3); cursor: pointer;">
+            </div>
+
+            <div class="form-group" style="margin-top: 12px;">
+              <label for="cfg-ocr-header-height">Altura de cabecera a analizar (% superior pág 1):</label>
+              <input type="number" id="cfg-ocr-header-height" class="form-control" min="10" max="60" value="30" style="width: 100px;">
+              <small class="form-text">30% recomendado para capturar la OF.</small>
+            </div>
+
+            <div class="form-group" style="margin-top: 10px;">
+              <label for="cfg-ocr-height">Altura del pie de página a analizar (% inferior):</label>
+              <input type="number" id="cfg-ocr-height" class="form-control" min="5" max="30" value="15" style="width: 100px;">
+              <small class="form-text">15% recomendado para capturar el código DC-XXXX.</small>
+            </div>
+
+            <div class="form-group" style="margin-top: 10px;">
+              <label for="cfg-catalog-path">Ruta del Excel de códigos oficiales:</label>
+              <input type="text" id="cfg-catalog-path" class="form-control" value="codigosOCR.xlsx">
+            </div>
+          </div>
+        </div>
+
+        <div class="modal-footer">
+          <button id="btn-save-settings" class="btn btn-primary">Guardar Configuración</button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

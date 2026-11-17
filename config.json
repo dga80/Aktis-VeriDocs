@@ -1,0 +1,14 @@
+{
+    "excel_path": "\\\\172.30.0.10\\Oficina_tecnica\\99-PEDIDOS EN CURSO AKTIS\\LISTADO PEDIDOS EN CURSO AKTIS.xlsm",
+    "excel_sheet": "Listado",
+    "escaneos_folder": "\\\\Mes-verificacio\\escaneos",
+    "destination_base_folder": "\\\\Mes-verificacio\\escaneos",
+    "ocr_catalog_path": "codigosOCR.xlsx",
+    "web_port": 5055,
+    "web_host": "0.0.0.0",
+    "ocr_enabled": true,
+    "ocr_header_height_percent": 30,
+    "ocr_footer_height_percent": 15,
+    "ocr_lang": "es-ES",
+    "auto_listen_on_startup": true
+}
