@@ -791,11 +791,13 @@ def process_scanned_pdf(
     1. Lee la cabecera (30%) de la página 1 con OCR para extraer la OF.
     2. Busca la OF en el Excel de Aktis para obtener Pedido ODOO, Descripción, etc.
     3. Analiza el pie de página de cada hoja del PDF contra codigosOCR.xlsx.
-    4. Agrupa páginas con el mismo código en un único PDF.
-    5. Para Incidencias (DC-0020, DC-0022), si hay más de 1 página genera documentos separados (1-3, 2-3, 3-3).
+    4. Gestión DÚPLEX (doble cara): Mantiene ambas caras únicamente para Pruebas FAT (DC-0034 y DC-0035).
+       Para el resto de códigos elimina automáticamente las caras en blanco (reversos dúplex).
+    5. Agrupa páginas con el mismo código en un único PDF.
+    6. Para Incidencias (DC-0020, DC-0022), si hay más de 1 página genera documentos separados (1-3, 2-3, 3-3).
        Se duplican en la carpeta 'incidencias' únicamente las páginas con código DC-0022 (DC-0020 no).
-    6. Guarda páginas no reconocidas en un PDF de revisión y genera alerta.
-    7. Guarda todo en la carpeta destino de la OF y archiva el PDF original escaneado.
+    7. Guarda páginas no reconocidas en un PDF de revisión y genera alerta.
+    8. Guarda todo en la carpeta destino de la OF y archiva el PDF original escaneado.
     """
     created_files = []
 
@@ -854,6 +856,13 @@ def process_scanned_pdf(
 
     detected_ofs = of_res.get("detected_ofs", [])
     best_of = of_res.get("best_of")
+
+    # Si la página 1 no tuviera la OF y hay más páginas (ej. escaneo dúplex con primera cara invertida), probar pág 2
+    if not best_of and total_pages > 1:
+        log("  ℹ️ No se detectó OF en página 1, probando cabecera de página 2...")
+        of_res = extract_of_from_header(src_doc, page_index=1, header_height_percent=header_pct, lang=ocr_lang)
+        detected_ofs = of_res.get("detected_ofs", [])
+        best_of = of_res.get("best_of")
 
     if not best_of:
         src_doc.close()
@@ -952,18 +961,6 @@ def process_scanned_pdf(
         rot_needed = detect_res.get("rotation_needed", 0)
         page_rotations[p_idx] = rot_needed
 
-        if matched_doc:
-            doc_name = matched_doc.get("documento", matched_code)
-            rot_tag = f" [Apaisado corregido {rot_needed}°]" if rot_needed else ""
-            log(f"  Pág {p_idx + 1}/{total_pages}: Código '{matched_code}' -> '{doc_name}'{rot_tag}")
-            notify_prog(f"Pág {p_idx + 1}/{total_pages}: {matched_code} ({doc_name}){rot_tag}", p_idx + 1, total_pages, of_val=of_str)
-        elif matched_code == "BLANK":
-            log(f"  Pág {p_idx + 1}/{total_pages}: Hoja en blanco detectada (reverso dúplex). Se omite automáticamente.")
-            notify_prog(f"Pág {p_idx + 1}/{total_pages}: Hoja en blanco (omitida)", p_idx + 1, total_pages, of_val=of_str)
-        else:
-            log(f"  Pág {p_idx + 1}/{total_pages}: ⚠️ Sin código reconocido.", "warning")
-            notify_prog(f"Pág {p_idx + 1}/{total_pages}: Sin código reconocido", p_idx + 1, total_pages, of_val=of_str)
-
         page_classifications.append({
             "page_idx": p_idx,
             "doc_def": matched_doc,
@@ -972,28 +969,95 @@ def process_scanned_pdf(
             "rotation_needed": rot_needed
         })
 
-    # 6. Agrupación por tipo de documento
-    # Estructura: code -> {"doc_def": ..., "pages": [idx1, idx2...]}
+    # 6. Agrupación por tipo de documento con soporte DÚPLEX (doble cara):
+    # - Si la hoja física tiene código DC-0034 o DC-0035 (Pruebas FAT), se MANTIENEN AMBAS CARAS (anverso y reverso).
+    # - Para el resto de códigos, la cara en blanco (reverso dúplex) se ELIMINA automáticamente.
+    DUPLEX_PRESERVE_CODES = ("DC-0034", "DC-0035")
     groups = {}
     unrecognized_pages = []
 
-    for item in page_classifications:
-        p_idx = item["page_idx"]
-        doc_def = item["doc_def"]
-        code = item["code"]
+    s = 0
+    while s * 2 < total_pages:
+        p_front = s * 2
+        p_back = p_front + 1 if p_front + 1 < total_pages else None
 
-        if code == "BLANK":
-            continue
+        item_f = page_classifications[p_front]
+        item_b = page_classifications[p_back] if p_back is not None else None
 
-        if doc_def and code:
-            if code not in groups:
-                groups[code] = {
-                    "doc_def": doc_def,
+        code_f = (item_f.get("code") or "").strip().upper()
+        code_b = (item_b.get("code") or "").strip().upper() if item_b else ""
+
+        # ¿Esta hoja física corresponde a Pruebas FAT (DC-0034 / DC-0035)?
+        is_fat_sheet = (code_f in DUPLEX_PRESERVE_CODES) or (code_b in DUPLEX_PRESERVE_CODES)
+
+        if is_fat_sheet:
+            fat_code = code_f if code_f in DUPLEX_PRESERVE_CODES else code_b
+            fat_doc_def = item_f.get("doc_def") if code_f in DUPLEX_PRESERVE_CODES else (item_b.get("doc_def") if item_b else None)
+            if not fat_doc_def:
+                for d in catalog:
+                    if d.get("codigo", "").strip().upper() == fat_code:
+                        fat_doc_def = d
+                        break
+
+            doc_name = fat_doc_def.get("documento", fat_code) if fat_doc_def else fat_code
+
+            if fat_code not in groups:
+                groups[fat_code] = {
+                    "doc_def": fat_doc_def or {"codigo": fat_code, "documento": doc_name},
                     "pages": []
                 }
-            groups[code]["pages"].append(p_idx)
+
+            rot_f = page_rotations.get(p_front, 0)
+            rot_tag_f = f" [Apaisado corregido {rot_f}°]" if rot_f else ""
+            log(f"  Pág {p_front + 1}/{total_pages}: Código '{fat_code}' -> '{doc_name}' (Anverso FAT){rot_tag_f}")
+            notify_prog(f"Pág {p_front + 1}/{total_pages}: {fat_code} (Anverso)", p_front + 1, total_pages, of_val=of_str)
+            groups[fat_code]["pages"].append(p_front)
+
+            if p_back is not None:
+                rot_b = page_rotations.get(p_back, 0)
+                rot_tag_b = f" [Apaisado corregido {rot_b}°]" if rot_b else ""
+                log(f"  Pág {p_back + 1}/{total_pages}: Doble cara mantenida para '{fat_code}' (Reverso FAT){rot_tag_b}")
+                notify_prog(f"Pág {p_back + 1}/{total_pages}: {fat_code} (Reverso)", p_back + 1, total_pages, of_val=of_str)
+                groups[fat_code]["pages"].append(p_back)
+
         else:
-            unrecognized_pages.append(p_idx)
+            # Documento normal: procesar cada cara y eliminar la cara en blanco
+            pages_to_check = [item_f]
+            if item_b is not None:
+                pages_to_check.append(item_b)
+
+            for item in pages_to_check:
+                p_idx = item["page_idx"]
+                doc_def = item["doc_def"]
+                code = (item.get("code") or "").strip().upper()
+                rot_needed = item.get("rotation_needed", 0)
+
+                # Comprobar si la cara está en blanco
+                is_blank = (code == "BLANK") or is_page_blank(src_doc, page_index=p_idx)
+
+                if is_blank:
+                    log(f"  Pág {p_idx + 1}/{total_pages}: Cara en blanco eliminada (reverso dúplex).")
+                    notify_prog(f"Pág {p_idx + 1}/{total_pages}: Cara en blanco (eliminada)", p_idx + 1, total_pages, of_val=of_str)
+                    continue
+
+                if doc_def and code and code != "BLANK":
+                    doc_name = doc_def.get("documento", code)
+                    rot_tag = f" [Apaisado corregido {rot_needed}°]" if rot_needed else ""
+                    log(f"  Pág {p_idx + 1}/{total_pages}: Código '{code}' -> '{doc_name}'{rot_tag}")
+                    notify_prog(f"Pág {p_idx + 1}/{total_pages}: {code} ({doc_name}){rot_tag}", p_idx + 1, total_pages, of_val=of_str)
+
+                    if code not in groups:
+                        groups[code] = {
+                            "doc_def": doc_def,
+                            "pages": []
+                        }
+                    groups[code]["pages"].append(p_idx)
+                else:
+                    log(f"  Pág {p_idx + 1}/{total_pages}: ⚠️ Sin código reconocido.", "warning")
+                    notify_prog(f"Pág {p_idx + 1}/{total_pages}: Sin código reconocido", p_idx + 1, total_pages, of_val=of_str)
+                    unrecognized_pages.append(p_idx)
+
+        s += 1
 
     # 7. Generación de los archivos PDF divididos
     escaneos_root = cfg.get("escaneos_folder") or dest_base

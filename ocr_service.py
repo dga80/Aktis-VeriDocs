@@ -139,13 +139,14 @@ def extract_text_from_image(img: Image.Image, lang: str = "es-ES") -> Dict[str, 
 def is_page_blank(
     pdf_input: Union[str, Any],
     page_index: int = 0,
-    dark_pixel_threshold: int = 220,
-    max_dark_ratio: float = 0.0025
+    dark_pixel_threshold: int = 190,
+    max_dark_ratio: float = 0.003
 ) -> bool:
     """
     Determina si una página escaneada está prácticamente en blanco (típico reverso dúplex).
-    Primero comprueba texto embebido nativo; si no hay, renderiza a 72 DPI y evalúa
-    la proporción de píxeles oscuros (< 0.25% se considera hoja en blanco).
+    Primero comprueba texto embebido nativo; si no hay, renderiza a 72 DPI, recorta márgenes
+    perimetrales del 5% (para omitir bordes de escáner, sombras y taladros) y evalúa
+    la proporción de píxeles oscuros (< 0.3% con umbral < 190 se considera hoja en blanco).
     """
     if not PDFIUM_AVAILABLE:
         return False
@@ -179,8 +180,17 @@ def is_page_blank(
 
         import numpy as np
         arr = np.array(gray)
-        dark_pixels = np.count_nonzero(arr < dark_pixel_threshold)
-        total_pixels = arr.size
+        h, w = arr.shape
+        if h == 0 or w == 0:
+            return True
+
+        # Omitir 5% de margen exterior para ignorar bordes negros del alimentador, sombras y taladros
+        my = int(h * 0.05)
+        mx = int(w * 0.05)
+        inner = arr[my:h - my, mx:w - mx] if (h > 2 * my and w > 2 * mx) else arr
+
+        dark_pixels = np.count_nonzero(inner < dark_pixel_threshold)
+        total_pixels = inner.size
         if total_pixels == 0:
             return True
 
@@ -712,6 +722,16 @@ def extract_footer_and_detect_code(
                 "rotation_needed": 180,
                 "text": res_top180.get("text", ""),
                 "strategy": "top_inverted_180"
+            }
+
+        # Si ninguna orientación detectó código, comprobar si la página está en blanco
+        if is_page_blank(doc, page_index=page_index, dark_pixel_threshold=190, max_dark_ratio=0.005):
+            return {
+                "matched_doc": None,
+                "matched_code": "BLANK",
+                "rotation_needed": 0,
+                "text": "",
+                "strategy": "blank_page_fallback"
             }
 
         return {
