@@ -793,6 +793,7 @@ def process_scanned_pdf(
     3. Analiza el pie de página de cada hoja del PDF contra codigosOCR.xlsx.
     4. Agrupa páginas con el mismo código en un único PDF.
     5. Para Incidencias (DC-0020, DC-0022), si hay más de 1 página genera documentos separados (1-3, 2-3, 3-3).
+       Se duplican en la carpeta 'incidencias' únicamente las páginas con código DC-0022 (DC-0020 no).
     6. Guarda páginas no reconocidas en un PDF de revisión y genera alerta.
     7. Guarda todo en la carpeta destino de la OF y archiva el PDF original escaneado.
     """
@@ -1034,14 +1035,15 @@ def process_scanned_pdf(
                 sub_doc.save(to_windows_long_path(out_path))
                 sub_doc.close()
 
-                # Duplicar copia en la carpeta general de incidencias
-                try:
-                    os.makedirs(to_windows_long_path(inc_folder), exist_ok=True)
-                    inc_dest = os.path.join(inc_folder, os.path.basename(out_path))
-                    shutil.copy2(to_windows_long_path(out_path), to_windows_long_path(inc_dest))
-                    log(f"  📋 Copia duplicada en carpeta 'Incidencias': '{os.path.basename(inc_dest)}'")
-                except Exception as e_copy_inc:
-                    log(f"  ⚠️ No se pudo copiar en Incidencias: {e_copy_inc}", "warning")
+                # Duplicar copia en la carpeta general de incidencias sólo para DC-0022 (las DC-0020 no)
+                if str(code).strip().upper() == "DC-0022":
+                    try:
+                        os.makedirs(to_windows_long_path(inc_folder), exist_ok=True)
+                        inc_dest = os.path.join(inc_folder, os.path.basename(out_path))
+                        shutil.copy2(to_windows_long_path(out_path), to_windows_long_path(inc_dest))
+                        log(f"  📋 Copia duplicada en carpeta 'Incidencias': '{os.path.basename(inc_dest)}'")
+                    except Exception as e_copy_inc:
+                        log(f"  ⚠️ No se pudo copiar en Incidencias: {e_copy_inc}", "warning")
 
                 created_files.append({
                     "code": code,
@@ -1077,8 +1079,8 @@ def process_scanned_pdf(
             sub_doc.save(to_windows_long_path(out_path))
             sub_doc.close()
 
-            # Si es incidencia (aunque tenga 1 sola hoja), duplicar también en la carpeta de incidencias
-            if is_inc:
+            # Duplicar copia en la carpeta general de incidencias sólo para DC-0022 (las DC-0020 no)
+            if str(code).strip().upper() == "DC-0022":
                 try:
                     os.makedirs(to_windows_long_path(inc_folder), exist_ok=True)
                     inc_dest = os.path.join(inc_folder, os.path.basename(out_path))

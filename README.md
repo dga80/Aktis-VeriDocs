@@ -15,7 +15,7 @@ Ya no es necesario que el operario busque la OF ni seleccione manualmente qué d
    * **Cliente** y datos adicionales
 4. **Troceado y Agrupación Inteligente:** Analiza el pie de página de cada hoja contra el catálogo maestro `codigosOCR.xlsx`:
    * Las páginas con el mismo código se **agrupan en un único PDF** (ej: Hoja de verificación de 3 páginas).
-   * **Incidencias (`DC-0020`):** Si hay más de 1 página de incidencias, se generan documentos independientes individuales con la nomenclatura `1-3`, `2-3`, `3-3`.
+   * **Incidencias (`DC-0020`, `DC-0022`):** Si hay más de 1 página de incidencias, se generan documentos independientes individuales con la nomenclatura `1-3`, `2-3`, `3-3`. Se duplican en la carpeta general de `incidencias` únicamente las páginas con código `DC-0022` (las `DC-0020` no se copian a dicha carpeta).
    * **Páginas no reconocidas:** Si alguna hoja tiene el pie borroso o sin código, se guarda en `REVISAR_PAGINAS_NO_IDENTIFICADAS - [OF].pdf` y **la app emite una alerta destacada en pantalla**.
 5. **Guardado y Archivado:** Crea la carpeta de la OF en la red de la empresa, guarda los PDFs clasificados y archiva una copia del PDF original escaneado.
 
