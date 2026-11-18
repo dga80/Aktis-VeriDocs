@@ -15,7 +15,7 @@ Ya no es necesario que el operario busque la OF ni seleccione manualmente qué d
    * **Cliente** y datos adicionales
 4. **Troceado y Agrupación Inteligente:** Analiza el pie de página de cada hoja contra el catálogo maestro `codigosOCR.xlsx`:
    * Las páginas con el mismo código se **agrupan en un único PDF** (ej: Hoja de verificación de 3 páginas).
-   * **Soporte Dúplex y Eliminación de Blancos:** En escaneos a doble cara, se conservan ambas caras (anverso y reverso) únicamente para los documentos de Pruebas FAT (`DC-0034` y `DC-0035`). En el resto de documentos, las caras en blanco se eliminan automáticamente para evitar páginas vacías o falsas alertas.
+   * **Soporte Dúplex y Descarte de Segunda Cara:** En escaneos a doble cara, se conservan ambas caras (anverso y reverso) únicamente para los documentos de Pruebas FAT (`DC-0034` y `DC-0035`). En el resto de documentos, la segunda cara (reverso) se elimina por descarte para evitar páginas vacías, manchas de arrastre o falsas alertas.
    * **Incidencias (`DC-0020`, `DC-0022`):** Si hay más de 1 página de incidencias, se generan documentos independientes individuales con la nomenclatura `1-3`, `2-3`, `3-3`. Se duplican en la carpeta general de `incidencias` únicamente las páginas con código `DC-0022` (las `DC-0020` no se copian a dicha carpeta).
    * **Páginas no reconocidas:** Si alguna hoja tiene el pie borroso o sin código, se guarda en `REVISAR_PAGINAS_NO_IDENTIFICADAS - [OF].pdf` y **la app emite una alerta destacada en pantalla**.
 5. **Guardado y Archivado:** Crea la carpeta de la OF en la red de la empresa, guarda los PDFs clasificados y archiva una copia del PDF original escaneado.

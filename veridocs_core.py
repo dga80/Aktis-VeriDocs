@@ -1021,41 +1021,46 @@ def process_scanned_pdf(
                 groups[fat_code]["pages"].append(p_back)
 
         else:
-            # Documento normal: procesar cada cara y eliminar la cara en blanco
-            pages_to_check = [item_f]
-            if item_b is not None:
-                pages_to_check.append(item_b)
+            # Documento normal: por descarte se elimina la segunda cara (reverso) de la hoja física
+            # Solo se mantiene p_front (o p_back si la hoja se introdujo al revés y el código está en el reverso)
+            if not code_f and code_b and is_page_blank(src_doc, page_index=p_front):
+                target_item = item_b
+                discard_idx = p_front
+            else:
+                target_item = item_f
+                discard_idx = p_back
 
-            for item in pages_to_check:
-                p_idx = item["page_idx"]
-                doc_def = item["doc_def"]
-                code = (item.get("code") or "").strip().upper()
-                rot_needed = item.get("rotation_needed", 0)
+            if discard_idx is not None:
+                log(f"  Pág {discard_idx + 1}/{total_pages}: Segunda cara descartada por descarte (dúplex).")
+                notify_prog(f"Pág {discard_idx + 1}/{total_pages}: Segunda cara (descartada)", discard_idx + 1, total_pages, of_val=of_str)
 
-                # Comprobar si la cara está en blanco
-                is_blank = (code == "BLANK") or is_page_blank(src_doc, page_index=p_idx)
+            p_idx = target_item["page_idx"]
+            doc_def = target_item["doc_def"]
+            code = (target_item.get("code") or "").strip().upper()
+            rot_needed = target_item.get("rotation_needed", 0)
 
-                if is_blank:
-                    log(f"  Pág {p_idx + 1}/{total_pages}: Cara en blanco eliminada (reverso dúplex).")
-                    notify_prog(f"Pág {p_idx + 1}/{total_pages}: Cara en blanco (eliminada)", p_idx + 1, total_pages, of_val=of_str)
-                    continue
+            # Comprobar si la cara activa está en blanco (ej. hoja blanca accidental)
+            is_blank = (code == "BLANK") or is_page_blank(src_doc, page_index=p_idx)
 
-                if doc_def and code and code != "BLANK":
-                    doc_name = doc_def.get("documento", code)
-                    rot_tag = f" [Apaisado corregido {rot_needed}°]" if rot_needed else ""
-                    log(f"  Pág {p_idx + 1}/{total_pages}: Código '{code}' -> '{doc_name}'{rot_tag}")
-                    notify_prog(f"Pág {p_idx + 1}/{total_pages}: {code} ({doc_name}){rot_tag}", p_idx + 1, total_pages, of_val=of_str)
+            if is_blank:
+                log(f"  Pág {p_idx + 1}/{total_pages}: Hoja en blanco descartada.")
+                notify_prog(f"Pág {p_idx + 1}/{total_pages}: Hoja en blanco (descartada)", p_idx + 1, total_pages, of_val=of_str)
+            elif doc_def and code and code != "BLANK":
+                doc_name = doc_def.get("documento", code)
+                rot_tag = f" [Apaisado corregido {rot_needed}°]" if rot_needed else ""
+                log(f"  Pág {p_idx + 1}/{total_pages}: Código '{code}' -> '{doc_name}'{rot_tag}")
+                notify_prog(f"Pág {p_idx + 1}/{total_pages}: {code} ({doc_name}){rot_tag}", p_idx + 1, total_pages, of_val=of_str)
 
-                    if code not in groups:
-                        groups[code] = {
-                            "doc_def": doc_def,
-                            "pages": []
-                        }
-                    groups[code]["pages"].append(p_idx)
-                else:
-                    log(f"  Pág {p_idx + 1}/{total_pages}: ⚠️ Sin código reconocido.", "warning")
-                    notify_prog(f"Pág {p_idx + 1}/{total_pages}: Sin código reconocido", p_idx + 1, total_pages, of_val=of_str)
-                    unrecognized_pages.append(p_idx)
+                if code not in groups:
+                    groups[code] = {
+                        "doc_def": doc_def,
+                        "pages": []
+                    }
+                groups[code]["pages"].append(p_idx)
+            else:
+                log(f"  Pág {p_idx + 1}/{total_pages}: ⚠️ Sin código reconocido.", "warning")
+                notify_prog(f"Pág {p_idx + 1}/{total_pages}: Sin código reconocido", p_idx + 1, total_pages, of_val=of_str)
+                unrecognized_pages.append(p_idx)
 
         s += 1
 
