@@ -1,6 +1,7 @@
 import os
 import re
 import asyncio
+import unicodedata
 from typing import Dict, List, Optional, Tuple, Any, Union
 from PIL import Image, ImageOps
 
@@ -234,6 +235,47 @@ def extract_footer_text(
     return extract_text_from_image(img, lang=lang)
 
 
+def _find_ofs_in_text(raw_text: str) -> List[str]:
+    """Busca patrones de OF (ej: AYC/MO/00524) dentro de un texto extraído."""
+    if not raw_text:
+        return []
+
+    clean_text = raw_text.replace('\r', ' ').replace('\n', ' ')
+
+    # Patrón principal: [PREFIJO]/MO/[NUMERO]
+    # Permite barras (/,\), pipes (|) o confusiones OCR verticales (I, 1, l, !)
+    primary_pat = re.compile(
+        r'\b([A-Za-z0-9_-]{2,8})\s*[/\\|I1l!]\s*MO\s*[/\\|I1l!]\s*([0-9OIl]{3,6})\b',
+        re.IGNORECASE
+    )
+
+    detected = []
+    for match in primary_pat.finditer(clean_text):
+        prefix = match.group(1).upper()
+        raw_num = match.group(2).upper()
+        clean_num = raw_num.replace('O', '0').replace('I', '1').replace('L', '1')
+        normalized_of = f"{prefix}/MO/{clean_num}"
+        if normalized_of not in detected:
+            detected.append(normalized_of)
+
+    # Patrón secundario más permisivo
+    if not detected:
+        secondary_pat = re.compile(r'([A-Za-z0-9_-]{2,8})[/\\|I1l!]+MO[/\\|I1l!]+(\d{3,6})', re.IGNORECASE)
+        for m in secondary_pat.finditer(clean_text):
+            cand = f"{m.group(1).upper()}/MO/{m.group(2)}"
+            if cand not in detected:
+                detected.append(cand)
+
+    # Patrón terciario: búsqueda de MO/[NUMERO]
+    if not detected:
+        tertiary_pat = re.compile(r'MO\s*[/\\|I1l!]\s*([0-9OIl]{3,6})', re.IGNORECASE)
+        for m in tertiary_pat.finditer(clean_text):
+            clean_num = m.group(1).upper().replace('O', '0').replace('I', '1').replace('L', '1')
+            detected.append(f"MO/{clean_num}")
+
+    return detected
+
+
 def extract_of_from_header(
     pdf_input: Union[str, Any],
     page_index: int = 0,
@@ -243,8 +285,11 @@ def extract_of_from_header(
     """
     Analiza la cabecera de la página indicada (normalmente la página 1) y busca la OF.
     Ejemplos esperados: AYC/MO/00560, CESA/MO/00154, LOESS/MO/00087, MES/MO/05310.
+    Si la página está apaisada (landscape) o rotada, prueba automáticamente
+    las orientaciones de 90°, 270° y 180° para asegurar la detección.
     Retorna la lista de candidatas detectadas y la mejor coincidencia.
     """
+    # 1. Intento estándar a 0°
     ocr_res = extract_header_text(
         pdf_input,
         page_index=page_index,
@@ -252,58 +297,68 @@ def extract_of_from_header(
         lang=lang
     )
 
-    if not ocr_res["success"]:
-        return {
-            "success": False,
-            "best_of": None,
-            "detected_ofs": [],
-            "raw_text": "",
-            "error": ocr_res["error"]
-        }
-
-    raw_text = ocr_res["text"]
-    lines = ocr_res.get("lines", [])
-    
-    # Normalizar espacios y saltos de línea
-    clean_text = raw_text.replace('\r', ' ').replace('\n', ' ')
-
-    # Patrón principal: [PREFIJO]/MO/[NUMERO]
-    # Permite barras, contrabarras o pipes, y corrige posibles confusiones OCR (O por 0, I/l por 1)
-    primary_pat = re.compile(
-        r'\b([A-Za-z0-9_-]{2,10})\s*[/\\|]\s*MO\s*[/\\|]\s*([0-9OIl]{3,6})\b',
-        re.IGNORECASE
-    )
-
     detected = []
-    for match in primary_pat.finditer(clean_text):
-        prefix = match.group(1).upper()
-        raw_num = match.group(2).upper()
-        # Normalizar ceros y unos mal leídos en la sección numérica
-        clean_num = raw_num.replace('O', '0').replace('I', '1').replace('L', '1')
-        normalized_of = f"{prefix}/MO/{clean_num}"
-        if normalized_of not in detected:
-            detected.append(normalized_of)
+    raw_text = ""
+    lines = []
 
-    # Patrón secundario más permisivo si el primero no encontró nada
-    if not detected:
-        secondary_pat = re.compile(r'([A-Za-z0-9_-]{2,10})/MO/(\d{3,6})', re.IGNORECASE)
-        normalized_str = clean_text.replace('\\', '/').replace('|', '/')
-        for m in secondary_pat.finditer(normalized_str):
-            cand = f"{m.group(1).upper()}/MO/{m.group(2)}"
-            if cand not in detected:
-                detected.append(cand)
+    if ocr_res.get("success"):
+        raw_text = ocr_res.get("text", "")
+        lines = ocr_res.get("lines", [])
+        detected = _find_ofs_in_text(raw_text)
 
-    # Patrón terciario: búsqueda de /MO/ aislado
-    if not detected:
-        tertiary_pat = re.compile(r'/MO/([0-9OIl]{3,6})', re.IGNORECASE)
-        for m in tertiary_pat.finditer(clean_text.replace('\\', '/').replace('|', '/')):
-            clean_num = m.group(1).upper().replace('O', '0').replace('I', '1').replace('L', '1')
-            detected.append(f"MO/{clean_num}")
+    # 2. Si no se encontró OF, probar en orientaciones rotadas (hojas apaisadas)
+    if not detected and PDFIUM_AVAILABLE and WINOCR_AVAILABLE:
+        close_doc = False
+        doc = None
+        try:
+            if isinstance(pdf_input, str):
+                if os.path.exists(pdf_input):
+                    doc = pdfium.PdfDocument(pdf_input)
+                    close_doc = True
+            else:
+                doc = pdf_input
+
+            if doc and page_index < len(doc):
+                page = doc[page_index]
+                pil_img = page.render(scale=2.5).to_pil()
+                
+                # Probar 90° horario (Image.Transpose.ROTATE_270)
+                rot90 = pil_img.transpose(Image.Transpose.ROTATE_270)
+                rw, rh = rot90.size
+                head90 = rot90.crop((0, 0, rw, int(rh * 0.40)))
+                res90 = extract_text_from_image(head90, lang=lang)
+                if res90.get("success"):
+                    det90 = _find_ofs_in_text(res90.get("text", ""))
+                    if det90:
+                        detected = det90
+                        raw_text = res90.get("text", "")
+                        lines = res90.get("lines", [])
+
+                # Si aún no, probar 270° horario (Image.Transpose.ROTATE_90)
+                if not detected:
+                    rot270 = pil_img.transpose(Image.Transpose.ROTATE_90)
+                    rw2, rh2 = rot270.size
+                    head270 = rot270.crop((0, 0, rw2, int(rh2 * 0.40)))
+                    res270 = extract_text_from_image(head270, lang=lang)
+                    if res270.get("success"):
+                        det270 = _find_ofs_in_text(res270.get("text", ""))
+                        if det270:
+                            detected = det270
+                            raw_text = res270.get("text", "")
+                            lines = res270.get("lines", [])
+        except Exception as e_rot_of:
+            print(f"[ocr_service] Error buscando OF en orientaciones rotadas: {e_rot_of}")
+        finally:
+            if close_doc and doc:
+                try:
+                    doc.close()
+                except Exception:
+                    pass
 
     best_of = detected[0] if detected else None
 
     return {
-        "success": True,
+        "success": bool(best_of),
         "best_of": best_of,
         "detected_ofs": detected,
         "raw_text": raw_text,
@@ -312,10 +367,129 @@ def extract_of_from_header(
     }
 
 
+DOCUMENT_KEYWORDS: Dict[str, List[str]] = {
+    "DC-0018": ["CARROS MAT", "CARROS MATERIAL", "CARRO MATERIAL"],
+    "DC-0019": ["ORDEN DE FABRICACION", "ORDEN DE FABRICACIÓN"],
+    "DC-0020": ["CONTROL ESTADO (INCIDENCIAS", "INCIDENCIAS-MATERIALES", "INCIDENCIAS MATERIALES"],
+    "DC-0021": ["CONTROL DE PENDIENTES", "TRABAJOS PENDIENTES", "CONTROL PENDIENTES"],
+    "DC-0022": ["ESTADO ENTRADA VERIFICA", "ENTRADA VERIFICA", "ENTRADA VERIFICACION"],
+    "DC-0023": ["PESAJES", "HOJA DE PESAJES"],
+    "DC-0024": ["EXPEDICIONES-SUBMER", "EXPEDICIONES SUBMER", "SUBMER"],
+    "DC-0025": ["D.CONFORMIDAD UE", "CONFORMIDAD UE", "DECLARACION DE CONFORMIDAD UE"],
+    "DC-0026": ["DECL.CONFORMIDAD UL508A", "UL508A", "CONFORMIDAD UL508A", "CONFORMIDAD UL"],
+    "DC-0027": ["CERTIFICADO GARANTIA MCD", "CERTIFICADO GARANTÍA MCD", "GARANTIA MCD", "GARANTÍA MCD"],
+    "DC-0028": ["VERIFICACION IEC - (ES)", "VERIFICACIÓN IEC - (ES)", "VERIFICACION IEC", "VERIFICACIÓN IEC"],
+    "DC-0029": [
+        "CONTROLES INTERNOS GENERAL",
+        "CONTROLES INTERNOS",
+        "INTERNOS GENERAL",
+        "DOCUMENTACION INTERNA A RELLENAR",
+        "DOCUMENTACION INTERNA",
+        "DOCUMENTACIÓN INTERNA"
+    ],
+    "DC-0030": ["VERIFICACION IEC - (EN)", "ROUTINE VERIFICATION", "VERIFICATION IEC"],
+    "DC-0031": ["VERIFICACION UL - (EN)", "VERIFICATION UL"],
+    "DC-0032": ["INFORME TECNICO INGENIERO", "INFORME TÉCNICO INGENIERO"],
+    "DC-0033": ["INFORME TECNICO OBRA", "INFORME TÉCNICO OBRA"],
+    "DC-0034": ["PRUEBAS FAT_(ES)", "PRUEBAS FAT (ES)", "PRUEBAS FAT"],
+    "DC-0035": ["PRUEBAS FAT_(EN)", "PRUEBAS FAT (EN)", "FAT TEST"],
+    "DC-0036": ["PRUEBAS FAT _CLIENTE_(ES)", "FAT CLIENTE"],
+    "DC-0037": ["PRUEBAS FAT _CLIENTE_(EN)", "FAT CLIENT"],
+    "DC-0038": ["HOJA ALMACEN", "HOJA ALMACÉN"],
+    "DC-0039": ["HOJA REVISION CUBICULOS", "HOJA REVISIÓN CUBÍCULOS", "REVISION CUBICULOS", "REVISIÓN CUBÍCULOS"],
+    "ANEXO 1_IT0001": ["ANEXO 1", "TAREAS DE VERIFICACION", "TAREAS DE VERIFICACIÓN"],
+    "ANEXO 2_IT0001": ["ANEXO 2", "CHECK MCD", "H.CHECK MCD"]
+}
+
+
+def suppress_table_lines(pil_img: Image.Image) -> Image.Image:
+    """
+    Detecta y suprime líneas horizontales continuas oscuras (bordes de tablas)
+    que suelen tocar o cortar los caracteres de código y texto en pies de página.
+    """
+    try:
+        import numpy as np
+        gray = pil_img.convert('L')
+        arr = np.array(gray)
+        h, w = arr.shape
+        if h < 10 or w < 30:
+            return pil_img
+
+        dark_mask = arr < 160
+        row_ratios = dark_mask.mean(axis=1)
+        lines_to_clear = [r for r in range(h) if row_ratios[r] > 0.30]
+        if not lines_to_clear:
+            return pil_img
+
+        cleaned = arr.copy()
+        for r in lines_to_clear:
+            r_min = max(0, r - 1)
+            r_max = min(h, r + 2)
+            cleaned[r_min:r_max, :] = 255
+
+        return Image.fromarray(cleaned).convert('RGB')
+    except Exception:
+        return pil_img
+
+
+def score_document_candidate(clean_text: str, compact_text: str, raw_code: str, doc_name: str) -> int:
+    """Evalúa la coincidencia de un candidato con el texto OCR asignando puntuación de 0 a 100."""
+    escaped = re.escape(raw_code)
+
+    # 1. Búsqueda exacta respetando límites alfanuméricos
+    if re.search(rf'(?<![A-Z0-9]){escaped}(?![A-Z0-9])', clean_text):
+        return 100
+
+    # 2. Tolerancia a espacios o guiones alternativos (ej: 'DC 0021' o 'DC_0021')
+    spaced = re.sub(r'[-_]', r'[-_\\s]+', escaped)
+    if re.search(rf'(?<![A-Z0-9]){spaced}(?![A-Z0-9])', clean_text):
+        return 90
+
+    # 3. Coincidencia compacta sin espacios ni guiones (ej: 'DC0021')
+    compact_code = re.sub(r'[\s\-_]', '', raw_code)
+    if len(compact_code) >= 4 and compact_code in compact_text:
+        return 85
+
+    # 4. Código numérico con contexto de documento (ej: Documento: 0021, DC-0O21)
+    m = re.match(r'DC-(\d{4})', raw_code)
+    if m:
+        num = m.group(1)
+        num_pat = num.replace('0', '[0O]')
+        if re.search(rf'(?:DC|C|DOC|DOCUMENTO)[\s\-_.:]*{num_pat}', clean_text):
+            return 80
+
+    # 5. Palabras clave y título del documento
+    import difflib
+    kws = DOCUMENT_KEYWORDS.get(raw_code, [])
+    if doc_name and doc_name.upper() not in [k.upper() for k in kws]:
+        kws = list(kws) + [doc_name.upper()]
+
+    score = 0
+    for kw in kws:
+        kw_clean = kw.upper()
+        if kw_clean in clean_text:
+            score = max(score, 75)
+        elif re.sub(r'[\s\-_()]', '', kw_clean) in compact_text:
+            score = max(score, 70)
+        else:
+            kw_words = [w for w in re.findall(r'[A-Z0-9ÁÉÍÓÚ]{4,}', kw_clean)]
+            if len(kw_words) >= 2:
+                matched_w = 0
+                for kw_w in kw_words:
+                    if any(kw_w in tw or tw in kw_w or difflib.SequenceMatcher(None, kw_w, tw).ratio() >= 0.75 
+                           for tw in re.findall(r'[A-Z0-9ÁÉÍÓÚ]{3,}', clean_text)):
+                        matched_w += 1
+                if matched_w == len(kw_words):
+                    score = max(score, 65)
+
+    return score
+
+
 def match_footer_code(ocr_text: str, candidates: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
     Compara el texto detectado por el OCR en el pie de página con el catálogo de códigos.
-    candidates: lista de dicts con al menos 'codigo' (o 'footer_code') y 'documento' (o 'name').
+    Utiliza búsqueda exacta de código, variantes con tolerancia a separadores,
+    patrón numérico con prefijo de documento y coincidencia semántica por título/palabras clave.
     Retorna (candidato_ganador, código_detectado) o (None, None).
     """
     if not ocr_text or not candidates:
@@ -324,46 +498,245 @@ def match_footer_code(ocr_text: str, candidates: List[Dict[str, Any]]) -> Tuple[
     clean_text = ocr_text.upper()
     compact_text = re.sub(r'[\s\-_]', '', clean_text)
 
-    # Ordenar candidatos dando prioridad a códigos más largos
-    def code_len(c):
-        code = str(c.get("codigo") or c.get("footer_code") or "")
-        return len(code)
+    best_item = None
+    best_code = None
+    best_score = 0
 
-    sorted_candidates = sorted(candidates, key=code_len, reverse=True)
-
-    for item in sorted_candidates:
-        raw_code = str(item.get("codigo") or item.get("footer_code") or "").strip().upper()
-        if not raw_code:
+    for item in candidates:
+        code = str(item.get("codigo") or item.get("footer_code") or "").strip().upper()
+        if not code:
             continue
+        name = str(item.get("documento") or item.get("name") or "").strip().upper()
+        score = score_document_candidate(clean_text, compact_text, code, name)
+        if score > best_score:
+            best_score = score
+            best_item = item
+            best_code = code
 
-        escaped = re.escape(raw_code)
-
-        # 1. Búsqueda exacta respetando límites alfanuméricos
-        if re.search(rf'(?<![A-Z0-9]){escaped}(?![A-Z0-9])', clean_text):
-            return item, raw_code
-
-        # 2. Tolerancia a espacios o guiones alternativos (ej: 'DC 0020' o 'DC_0020' por 'DC-0020')
-        spaced_pattern = re.sub(r'[-_]', r'[-_\\s]+', escaped)
-        if re.search(rf'(?<![A-Z0-9]){spaced_pattern}(?![A-Z0-9])', clean_text):
-            return item, raw_code
-
-        # 3. Coincidencia compacta sin espacios ni guiones (ej: 'DC0020')
-        compact_code = re.sub(r'[\s\-_]', '', raw_code)
-        if len(compact_code) >= 4 and compact_code in compact_text:
-            return item, raw_code
-
-        # 4. En anexos complejos (ej: ANEXO 1_IT0001), permitir coincidencia con 'ANEXO 1', 'IT0001' o descripción
-        if "ANEXO" in raw_code:
-            parts = raw_code.split('_')
-            for part in parts:
-                if len(part) >= 4 and re.search(rf'(?<![A-Z0-9]){re.escape(part)}(?![A-Z0-9])', clean_text):
-                    return item, raw_code
-            if "1" in raw_code and "ANEXO" in clean_text and ("VERIFICA" in clean_text or "TAREAS" in clean_text):
-                return item, raw_code
-            if "2" in raw_code and ("CHECK" in clean_text or "MCD" in clean_text):
-                return item, raw_code
-
+    if best_score >= 60:
+        return best_item, best_code
     return None, None
+
+
+def extract_footer_and_detect_code(
+    pdf_input: Union[str, Any],
+    catalog: List[Dict[str, Any]],
+    page_index: int = 0,
+    footer_height_percent: int = 15,
+    lang: str = "es-ES"
+) -> Dict[str, Any]:
+    """
+    Analiza una página para identificar el código de documento oficial en el pie.
+    Incluye detección automática para hojas apaisadas (landscape) y volteadas:
+    1. Intento estándar: Franja inferior (0°).
+    2. Si no coincide, analiza la orientación apaisada 90° horario (pie y cabecera).
+    3. Si no coincide, analiza la orientación apaisada 270° horario (pie y cabecera).
+    4. Si aún no coincide, analiza la franja superior invertida (180°).
+    
+    Retorna un diccionario con:
+    - matched_doc: Dict o None
+    - matched_code: str o None
+    - rotation_needed: int (0, 90, 180, 270)
+    - text: str
+    - strategy: str
+    """
+    if not PDFIUM_AVAILABLE or not WINOCR_AVAILABLE:
+        return {"matched_doc": None, "matched_code": None, "rotation_needed": 0, "text": "", "strategy": "ocr_unavailable"}
+
+    close_doc_at_end = False
+    doc = None
+    if isinstance(pdf_input, str):
+        if not os.path.exists(pdf_input):
+            return {"matched_doc": None, "matched_code": None, "rotation_needed": 0, "text": "", "strategy": "file_not_found"}
+        try:
+            doc = pdfium.PdfDocument(pdf_input)
+            close_doc_at_end = True
+        except Exception as e:
+            return {"matched_doc": None, "matched_code": None, "rotation_needed": 0, "text": "", "strategy": f"open_error: {e}"}
+    else:
+        doc = pdf_input
+
+    try:
+        if len(doc) <= page_index:
+            return {"matched_doc": None, "matched_code": None, "rotation_needed": 0, "text": "", "strategy": "index_out_of_range"}
+
+        # 1. Renderizado a escala óptima (2.5) para nitidez OCR
+        page = doc[page_index]
+        pil_img = page.render(scale=2.5).to_pil()
+        width, height = pil_img.size
+
+        # --- ESTRATEGIA 1: Pie de página estándar inferior (0°) ---
+        pct = max(5, min(80, footer_height_percent))
+        crop_top = int(height * (1.0 - (pct / 100.0)))
+        bottom_img = pil_img.crop((0, crop_top, width, height))
+
+        res_bottom = extract_text_from_image(bottom_img, lang=lang)
+        matched_doc, matched_code = match_footer_code(res_bottom.get("text", ""), catalog)
+
+        # 1.1 Si no coincide a escala estándar, reescalar 2x (vital para fuentes pequeñas < 6pt)
+        if not matched_doc:
+            bw, bh = bottom_img.size
+            scaled_bottom = bottom_img.resize((bw * 2, bh * 2), Image.Resampling.LANCZOS)
+            res_bottom_scaled = extract_text_from_image(scaled_bottom, lang=lang)
+            matched_doc, matched_code = match_footer_code(res_bottom_scaled.get("text", ""), catalog)
+            if matched_doc:
+                res_bottom = res_bottom_scaled
+
+        # 1.2 Si aún no coincide, probar con supresión de bordes de tabla + 2x
+        if not matched_doc:
+            cleaned_bottom = suppress_table_lines(bottom_img)
+            cbw, cbh = cleaned_bottom.size
+            cleaned_scaled = cleaned_bottom.resize((cbw * 2, cbh * 2), Image.Resampling.LANCZOS)
+            res_bottom_cleaned = extract_text_from_image(cleaned_scaled, lang=lang)
+            matched_doc, matched_code = match_footer_code(res_bottom_cleaned.get("text", ""), catalog)
+            if matched_doc:
+                res_bottom = res_bottom_cleaned
+
+        if matched_doc:
+            return {
+                "matched_doc": matched_doc,
+                "matched_code": matched_code,
+                "rotation_needed": 0,
+                "text": res_bottom.get("text", ""),
+                "strategy": "bottom_standard"
+            }
+
+        # Comprobar si la página está en blanco antes de gastar recursos en rotaciones
+        if is_page_blank(doc, page_index=page_index):
+            return {
+                "matched_doc": None,
+                "matched_code": "BLANK",
+                "rotation_needed": 0,
+                "text": "",
+                "strategy": "blank_page"
+            }
+
+        # --- ESTRATEGIA 2: Hoja apaisada rotada 90° horario (Image.Transpose.ROTATE_270) ---
+        margin_pct = 0.22
+        right_x = int(width * (1.0 - margin_pct))
+        right_strip = pil_img.crop((right_x, 0, width, height))
+        rot270_strip = right_strip.transpose(Image.Transpose.ROTATE_270)
+        rw270, rh270 = rot270_strip.size
+        scaled_r270 = rot270_strip.resize((rw270 * 2, rh270 * 2), Image.Resampling.LANCZOS)
+        
+        res_r270 = extract_text_from_image(scaled_r270, lang=lang)
+        matched_doc, matched_code = match_footer_code(res_r270.get("text", ""), catalog)
+        if not matched_doc:
+            res_r270_clean = extract_text_from_image(suppress_table_lines(scaled_r270), lang=lang)
+            matched_doc, matched_code = match_footer_code(res_r270_clean.get("text", ""), catalog)
+            if matched_doc:
+                res_r270 = res_r270_clean
+
+        if matched_doc:
+            return {
+                "matched_doc": matched_doc,
+                "matched_code": matched_code,
+                "rotation_needed": 90,
+                "text": res_r270.get("text", ""),
+                "strategy": "right_margin_rot90"
+            }
+
+        # Cabecera de la orientación rotada 90° (por si el pie está degradado pero el título es legible)
+        rot270_page = pil_img.transpose(Image.Transpose.ROTATE_270)
+        rpw270, rph270 = rot270_page.size
+        head270 = rot270_page.crop((0, 0, rpw270, int(rph270 * 0.25)))
+        res_head270 = extract_text_from_image(head270, lang=lang)
+        matched_doc, matched_code = match_footer_code(res_head270.get("text", ""), catalog)
+        if matched_doc:
+            return {
+                "matched_doc": matched_doc,
+                "matched_code": matched_code,
+                "rotation_needed": 90,
+                "text": res_head270.get("text", ""),
+                "strategy": "rot90_header"
+            }
+
+        # --- ESTRATEGIA 3: Hoja apaisada rotada 270° horario (Image.Transpose.ROTATE_90) ---
+        left_w = int(width * margin_pct)
+        left_strip = pil_img.crop((0, 0, left_w, height))
+        rot90_strip = left_strip.transpose(Image.Transpose.ROTATE_90)
+        rw90, rh90 = rot90_strip.size
+        scaled_r90 = rot90_strip.resize((rw90 * 2, rh90 * 2), Image.Resampling.LANCZOS)
+        
+        res_r90 = extract_text_from_image(scaled_r90, lang=lang)
+        matched_doc, matched_code = match_footer_code(res_r90.get("text", ""), catalog)
+        if not matched_doc:
+            res_r90_clean = extract_text_from_image(suppress_table_lines(scaled_r90), lang=lang)
+            matched_doc, matched_code = match_footer_code(res_r90_clean.get("text", ""), catalog)
+            if matched_doc:
+                res_r90 = res_r90_clean
+
+        if matched_doc:
+            return {
+                "matched_doc": matched_doc,
+                "matched_code": matched_code,
+                "rotation_needed": 270,
+                "text": res_r90.get("text", ""),
+                "strategy": "left_margin_rot270"
+            }
+
+        # Cabecera de la orientación rotada 270°
+        rot90_page = pil_img.transpose(Image.Transpose.ROTATE_90)
+        rpw90, rph90 = rot90_page.size
+        head90 = rot90_page.crop((0, 0, rpw90, int(rph90 * 0.25)))
+        res_head90 = extract_text_from_image(head90, lang=lang)
+        matched_doc, matched_code = match_footer_code(res_head90.get("text", ""), catalog)
+        if matched_doc:
+            return {
+                "matched_doc": matched_doc,
+                "matched_code": matched_code,
+                "rotation_needed": 270,
+                "text": res_head90.get("text", ""),
+                "strategy": "rot270_header"
+            }
+
+        # --- ESTRATEGIA 4: Margen superior invertido 180° ---
+        top_h = int(height * (pct / 100.0))
+        top_strip = pil_img.crop((0, 0, width, top_h))
+        rot_top180 = top_strip.transpose(Image.Transpose.ROTATE_180)
+        tw180, th180 = rot_top180.size
+        scaled_top180 = rot_top180.resize((tw180 * 2, th180 * 2), Image.Resampling.LANCZOS)
+        
+        res_top180 = extract_text_from_image(scaled_top180, lang=lang)
+        matched_doc, matched_code = match_footer_code(res_top180.get("text", ""), catalog)
+        if not matched_doc:
+            res_top180_clean = extract_text_from_image(suppress_table_lines(scaled_top180), lang=lang)
+            matched_doc, matched_code = match_footer_code(res_top180_clean.get("text", ""), catalog)
+            if matched_doc:
+                res_top180 = res_top180_clean
+
+        if matched_doc:
+            return {
+                "matched_doc": matched_doc,
+                "matched_code": matched_code,
+                "rotation_needed": 180,
+                "text": res_top180.get("text", ""),
+                "strategy": "top_inverted_180"
+            }
+
+        return {
+            "matched_doc": None,
+            "matched_code": None,
+            "rotation_needed": 0,
+            "text": res_bottom.get("text", ""),
+            "strategy": "not_found"
+        }
+
+    except Exception as e:
+        print(f"[extract_footer_and_detect_code] Error: {e}")
+        return {
+            "matched_doc": None,
+            "matched_code": None,
+            "rotation_needed": 0,
+            "text": "",
+            "strategy": f"exception: {e}"
+        }
+    finally:
+        if close_doc_at_end and doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
 
 
 def identify_document_from_pdf(
@@ -428,7 +801,7 @@ def load_ocr_catalog(excel_path: Optional[str] = None) -> List[Dict[str, Any]]:
             code = str(row[0]).strip() if row[0] is not None else ""
             doc_name = str(row[1]).strip() if row[1] is not None else ""
             if code and doc_name:
-                is_inc = (code.upper() == "DC-0020" or "INCIDENCIA" in doc_name.upper())
+                is_inc = (code.upper() in ("DC-0020", "DC-0022") or "INCIDENCIA" in doc_name.upper())
                 catalog.append({
                     "id": idx,
                     "codigo": code,

@@ -3,9 +3,13 @@ import sys
 import time
 import threading
 import subprocess
+import warnings
+from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import customtkinter as ctk
+
+warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
 
 from config import load_config, save_config
 from veridocs_core import (
@@ -23,22 +27,76 @@ ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
 
+def show_system_notification(title: str, message: str, is_error: bool = False):
+    """Emite sonido de confirmación y lanza una notificación nativa Toast de Windows si es posible."""
+    def _run():
+        try:
+            import winsound
+            snd = winsound.MB_ICONHAND if is_error else winsound.MB_ICONASTERISK
+            winsound.MessageBeep(snd)
+        except Exception:
+            pass
+
+        try:
+            t = title.replace("'", "''").replace('"', '""')
+            m = message.replace("'", "''").replace('"', '""')
+            ps_script = (
+                "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null; "
+                "$template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02); "
+                "$textNodes = $template.GetElementsByTagName('text'); "
+                f"$textNodes.Item(0).AppendChild($template.CreateTextNode('{t}')) | Out-Null; "
+                f"$textNodes.Item(1).AppendChild($template.CreateTextNode('{m}')) | Out-Null; "
+                "$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('VeriDocs'); "
+                "$notification = [Windows.UI.Notifications.ToastNotification]::new($template); "
+                "$notifier.Show($notification);"
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script],
+                capture_output=True,
+                timeout=4
+            )
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def copy_to_clipboard(root: tk.Tk, text: str, feedback_label: ctk.CTkLabel = None):
+    """Copia texto al portapapeles de Windows y opcionalmente muestra feedback."""
+    try:
+        root.clipboard_clear()
+        root.clipboard_append(text)
+        root.update()
+        if feedback_label:
+            original_text = feedback_label.cget("text")
+            feedback_label.configure(text="✓ Copiado!")
+            root.after(1500, lambda: feedback_label.configure(text=original_text))
+    except Exception as e:
+        print(f"[copy_to_clipboard] Error: {e}")
+
+
 class VeriDocsDesktopApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
         self.title("VeriDocs - Gestión y Renombrado Automático de Escaneos MES")
-        self.geometry("1180x820")
-        self.minsize(1020, 720)
+        self.geometry("1240x840")
+        self.minsize(1040, 720)
 
         self.excel_manager = ExcelManager()
         self.session_manager = ScanningSession(self.excel_manager)
         self.catalog = load_ocr_catalog()
+        self.filtered_catalog = list(self.catalog)
         self.selected_order = None
-        self.poll_timer_id = None
-        self.last_batch_time = None
+        self.current_alert_data = None
 
-        # Iniciar escucha automática de inmediato al arrancar si está habilitado en configuración
+        # Variables de control para evitar refrescos innecesarios de UI
+        self.last_rendered_batch_key = None
+        self.last_rendered_live_count = -1
+        self.seen_log_count = 0
+        self.seen_batches_count = -1
+
+        # Iniciar escucha automática si está configurada
         cfg = load_config()
         if cfg.get("auto_listen_on_startup", True):
             self.session_manager.start_listening()
@@ -46,10 +104,10 @@ class VeriDocsDesktopApp(ctk.CTk):
         self.setup_ui()
         self.check_system_connectivity()
 
-        # Cargar Excel en segundo plano al arrancar
+        # Cargar pedidos de Excel en segundo plano
         threading.Thread(target=self._initial_load_excel, daemon=True).start()
 
-        # Iniciar sondeo regular del estado de la sesión
+        # Sondeo periódico de la sesión
         self.poll_session_status()
 
     def _initial_load_excel(self):
@@ -60,30 +118,34 @@ class VeriDocsDesktopApp(ctk.CTk):
             pass
 
     def setup_ui(self):
-        # Header Frame
-        header = ctk.CTkFrame(self, height=60, corner_radius=8)
-        header.pack(fill="x", padx=16, pady=(12, 8))
+        # 1. Cabecera principal
+        header = ctk.CTkFrame(self, height=64, corner_radius=8)
+        header.pack(fill="x", padx=16, pady=(12, 6))
+
+        # Título y Subtítulo
+        title_box = ctk.CTkFrame(header, fg_color="transparent")
+        title_box.pack(side="left", padx=14, pady=8)
 
         title_lbl = ctk.CTkLabel(
-            header,
+            title_box,
             text="📁 VeriDocs",
             font=ctk.CTkFont(size=20, weight="bold")
         )
-        title_lbl.pack(side="left", padx=16)
+        title_lbl.pack(anchor="w")
 
         subtitle_lbl = ctk.CTkLabel(
-            header,
-            text="Clasificación y troceado automático de dossiers por OF",
-            font=ctk.CTkFont(size=13),
+            title_box,
+            text="Troceado y clasificación automática de dossiers MES",
+            font=ctk.CTkFont(size=12),
             text_color="gray"
         )
-        subtitle_lbl.pack(side="left", padx=(0, 20))
+        subtitle_lbl.pack(anchor="w")
 
-        # Action & Indicators
+        # Botón de configuración
         btn_settings = ctk.CTkButton(
             header,
             text="⚙️ Configuración",
-            width=135,
+            width=130,
             height=32,
             font=ctk.CTkFont(size=12, weight="bold"),
             fg_color="#3b82f6",
@@ -92,24 +154,43 @@ class VeriDocsDesktopApp(ctk.CTk):
         )
         btn_settings.pack(side="right", padx=(8, 14))
 
-        self.lbl_ocr_status = ctk.CTkLabel(
-            header, text="OCR: Comprobando...", font=ctk.CTkFont(size=12, weight="bold")
+        # Píldoras de estado en la cabecera (Badge chips)
+        self.pill_ocr = ctk.CTkLabel(
+            header,
+            text="● OCR: Comprobando...",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="gray25",
+            corner_radius=12,
+            padx=10,
+            pady=4
         )
-        self.lbl_ocr_status.pack(side="right", padx=10)
+        self.pill_ocr.pack(side="right", padx=6)
 
-        self.lbl_folder_status = ctk.CTkLabel(
-            header, text="Escaneos: Comprobando...", font=ctk.CTkFont(size=12, weight="bold")
+        self.pill_folder = ctk.CTkLabel(
+            header,
+            text="● Bandeja: Comprobando...",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="gray25",
+            corner_radius=12,
+            padx=10,
+            pady=4
         )
-        self.lbl_folder_status.pack(side="right", padx=10)
+        self.pill_folder.pack(side="right", padx=6)
 
-        self.lbl_excel_status = ctk.CTkLabel(
-            header, text="Excel: Comprobando...", font=ctk.CTkFont(size=12, weight="bold")
+        self.pill_excel = ctk.CTkLabel(
+            header,
+            text="● Excel: Comprobando...",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="gray25",
+            corner_radius=12,
+            padx=10,
+            pady=4
         )
-        self.lbl_excel_status.pack(side="right", padx=10)
+        self.pill_excel.pack(side="right", padx=6)
 
-        # Alert Banner (Visible when active alert exists)
-        self.alert_frame = ctk.CTkFrame(self, fg_color=("#b91c1c", "#7f1d1d"), corner_radius=8)
-        # Not packed initially
+        # 2. Banner de Alertas (Visible solo cuando hay alerta activa)
+        self.alert_frame = ctk.CTkFrame(self, fg_color=("#991b1b", "#7f1d1d"), corner_radius=8)
+        # Oculto por defecto
 
         self.lbl_alert_icon = ctk.CTkLabel(
             self.alert_frame, text="⚠️", font=ctk.CTkFont(size=22)
@@ -122,21 +203,22 @@ class VeriDocsDesktopApp(ctk.CTk):
             font=ctk.CTkFont(size=13, weight="bold"),
             text_color="white",
             justify="left",
-            wraplength=700
+            wraplength=720
         )
         self.lbl_alert_msg.pack(side="left", padx=8, pady=10, fill="x", expand=True)
 
         self.btn_alert_folder = ctk.CTkButton(
             self.alert_frame,
             text="📂 Abrir Carpeta",
-            width=120,
+            width=125,
             height=30,
             fg_color="#f59e0b",
             hover_color="#d97706",
+            text_color="black",
             font=ctk.CTkFont(weight="bold"),
             command=self.open_alert_folder
         )
-        self.btn_alert_folder.pack(side="right", padx=(6, 10), pady=10)
+        self.btn_alert_folder.pack(side="right", padx=(6, 8), pady=10)
 
         self.btn_alert_dismiss = ctk.CTkButton(
             self.alert_frame,
@@ -148,268 +230,535 @@ class VeriDocsDesktopApp(ctk.CTk):
             font=ctk.CTkFont(weight="bold"),
             command=self.dismiss_current_alert
         )
-        self.btn_alert_dismiss.pack(side="right", padx=(4, 6), pady=10)
+        self.btn_alert_dismiss.pack(side="right", padx=(4, 10), pady=10)
 
-        self.current_alert_data = None
-
-        # Main Split Content
+        # 3. Contenedor dividido en 2 columnas
         self.main_content = ctk.CTkFrame(self, fg_color="transparent")
-        self.main_content.pack(fill="both", expand=True, padx=16, pady=8)
+        self.main_content.pack(fill="both", expand=True, padx=16, pady=(4, 10))
 
-        self.main_content.grid_columnconfigure(0, weight=4) # Left column
-        self.main_content.grid_columnconfigure(1, weight=6) # Right column
+        self.main_content.grid_columnconfigure(0, weight=4) # Columna izquierda
+        self.main_content.grid_columnconfigure(1, weight=6) # Columna derecha
         self.main_content.grid_rowconfigure(0, weight=1)
 
-        # Left Column (Controls, Catalog & Aktis Query)
+        # Columna Izquierda (Pestañas ergonómicas)
         left_col = ctk.CTkFrame(self.main_content)
         left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         self.setup_left_column(left_col)
 
-        # Right Column (Latest Batch Results & Realtime Monitor)
+        # Columna Derecha (Monitor en tiempo real, lote y consola)
         right_col = ctk.CTkFrame(self.main_content)
         right_col.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
         self.setup_right_column(right_col)
 
     def setup_left_column(self, parent):
         parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(0, weight=1)
 
-        # Card 1: Escucha Automática en Directo
-        card_monitor = ctk.CTkFrame(parent, fg_color=("gray85", "gray17"), corner_radius=6)
-        card_monitor.pack(fill="x", padx=12, pady=(12, 8))
+        # Pestañas ergonómicas
+        self.left_tabs = ctk.CTkTabview(parent)
+        self.left_tabs.pack(fill="both", expand=True, padx=8, pady=8)
 
-        m_header = ctk.CTkFrame(card_monitor, fg_color="transparent")
-        m_header.pack(fill="x", padx=12, pady=(10, 4))
+        tab_listen = self.left_tabs.add("🎧 Escucha")
+        tab_history = self.left_tabs.add("📜 Historial")
+        tab_aktis = self.left_tabs.add("🔍 Consulta Aktis")
+        tab_cat = self.left_tabs.add("📋 Catálogo OCR")
+
+        # --- TAB 1: ESCUCHA AUTOMÁTICA ---
+        tab_listen.grid_columnconfigure(0, weight=1)
+
+        box_badge = ctk.CTkFrame(tab_listen, fg_color="transparent")
+        box_badge.pack(fill="x", padx=10, pady=(12, 6))
 
         ctk.CTkLabel(
-            m_header,
-            text="1. Escucha de Escaneos",
-            font=ctk.CTkFont(size=15, weight="bold")
+            box_badge,
+            text="Estado del Monitor:",
+            font=ctk.CTkFont(size=14, weight="bold")
         ).pack(side="left")
 
-        is_active = self.session_manager.active
+        is_act = self.session_manager.active
         self.lbl_session_badge = ctk.CTkLabel(
-            m_header,
-            text="ESCUCHANDO BANDEJA" if is_active else "INACTIVO",
-            fg_color="#10b981" if is_active else "gray30",
+            box_badge,
+            text="ESCUCHANDO BANDEJA" if is_act else "INACTIVO",
+            fg_color="#10b981" if is_act else "gray30",
             corner_radius=10,
-            padx=10,
+            padx=12,
+            pady=3,
             font=ctk.CTkFont(size=11, weight="bold")
         )
         self.lbl_session_badge.pack(side="right")
 
         self.btn_toggle_listen = ctk.CTkButton(
-            card_monitor,
-            text="⏹ DETENER ESCUCHA" if is_active else "▶ INICIAR ESCUCHA AUTOMÁTICA",
-            height=44,
-            fg_color="#ef4444" if is_active else "#059669",
-            hover_color="#dc2626" if is_active else "#047857",
+            tab_listen,
+            text="⏹ DETENER ESCUCHA" if is_act else "▶ INICIAR ESCUCHA AUTOMÁTICA",
+            height=48,
+            fg_color="#ef4444" if is_act else "#059669",
+            hover_color="#dc2626" if is_act else "#047857",
             text_color="#ffffff",
             font=ctk.CTkFont(size=14, weight="bold"),
             command=self.toggle_listening
         )
-        self.btn_toggle_listen.pack(fill="x", padx=12, pady=6)
+        self.btn_toggle_listen.pack(fill="x", padx=10, pady=(4, 10))
+
+        card_info = ctk.CTkFrame(tab_listen, fg_color=("gray90", "gray17"), corner_radius=6)
+        card_info.pack(fill="x", padx=10, pady=6)
+
+        ctk.CTkLabel(
+            card_info,
+            text="💡 Funcionamiento Continuo",
+            font=ctk.CTkFont(size=13, weight="bold")
+        ).pack(anchor="w", padx=12, pady=(10, 4))
 
         self.lbl_listen_info = ctk.CTkLabel(
-            card_monitor,
-            text="● Modo continuo: al escanear un dossier, VeriDocs leerá la OF de la pág. 1, consultará Aktis, clasificará y troceará según 'codigosOCR.xlsx'.",
+            card_info,
+            text="Al escanear un dossier en la fotocopiadora, VeriDocs lo detectará en pocos segundos, leerá la OF de la pág. 1, consultará Aktis, clasificará y troceará cada documento según el catálogo oficial.\n\nSoporta detección y corrección automática de hojas apaisadas y códigos rotados.",
             font=ctk.CTkFont(size=11),
             text_color="gray",
-            wraplength=420,
+            wraplength=380,
             justify="left"
         )
-        self.lbl_listen_info.pack(anchor="w", padx=12, pady=(0, 6))
+        self.lbl_listen_info.pack(anchor="w", padx=12, pady=(0, 10))
 
-        # Botón de procesamiento manual
-        btn_manual = ctk.CTkButton(
-            card_monitor,
-            text="📄 Procesar Archivo PDF Manualmente...",
+        btn_open_scan_dir = ctk.CTkButton(
+            card_info,
+            text="📂 Abrir Bandeja de Escaneos...",
             height=32,
+            fg_color="gray30",
+            hover_color="gray40",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self.open_scans_folder
+        )
+        btn_open_scan_dir.pack(fill="x", padx=12, pady=(0, 10))
+
+        card_manual = ctk.CTkFrame(tab_listen, fg_color=("gray90", "gray17"), corner_radius=6)
+        card_manual.pack(fill="x", padx=10, pady=(8, 10))
+
+        ctk.CTkLabel(
+            card_manual,
+            text="📄 Procesamiento Manual",
+            font=ctk.CTkFont(size=13, weight="bold")
+        ).pack(anchor="w", padx=12, pady=(10, 4))
+
+        ctk.CTkLabel(
+            card_manual,
+            text="¿Quieres clasificar un PDF que ya tienes guardado en tu equipo?",
+            font=ctk.CTkFont(size=11),
+            text_color="gray"
+        ).pack(anchor="w", padx=12, pady=(0, 6))
+
+        btn_manual = ctk.CTkButton(
+            card_manual,
+            text="Seleccionar y Procesar Archivo PDF...",
+            height=34,
             fg_color=("#3b82f6", "#2563eb"),
             hover_color=("#1d4ed8", "#1d4ed8"),
             font=ctk.CTkFont(size=12, weight="bold"),
             command=self.process_pdf_manually
         )
-        btn_manual.pack(fill="x", padx=12, pady=(4, 10))
+        btn_manual.pack(fill="x", padx=12, pady=(0, 12))
 
-        # Card 2: Catálogo de Documentos (codigosOCR.xlsx)
-        card_catalog = ctk.CTkFrame(parent, fg_color=("gray85", "gray17"), corner_radius=6)
-        card_catalog.pack(fill="both", expand=True, padx=12, pady=6)
+        # --- TAB 2: HISTORIAL DE LOTES ---
+        self.setup_history_tab(tab_history)
 
-        c_header = ctk.CTkFrame(card_catalog, fg_color="transparent")
-        c_header.pack(fill="x", padx=10, pady=(10, 4))
+        # --- TAB 3: CONSULTA AKTIS ---
+        self.setup_aktis_tab(tab_aktis)
 
-        self.lbl_catalog_title = ctk.CTkLabel(
-            c_header,
-            text=f"2. Catálogo Oficial ({len(self.catalog)} tipos)",
-            font=ctk.CTkFont(size=14, weight="bold")
+        # --- TAB 4: CATÁLOGO OCR ---
+        self.setup_catalog_tab(tab_cat)
+
+    def setup_history_tab(self, parent):
+        parent.grid_columnconfigure(0, weight=1)
+
+        h_header = ctk.CTkFrame(parent, fg_color="transparent")
+        h_header.pack(fill="x", padx=10, pady=(10, 4))
+
+        self.lbl_hist_title = ctk.CTkLabel(
+            h_header,
+            text="Lotes Procesados (0)",
+            font=ctk.CTkFont(size=13, weight="bold")
         )
-        self.lbl_catalog_title.pack(side="left")
+        self.lbl_hist_title.pack(side="left")
 
-        btn_reload_cat = ctk.CTkButton(
-            c_header,
-            text="↻ Recargar",
-            width=75,
+        btn_clear_hist = ctk.CTkButton(
+            h_header,
+            text="🗑️ Vaciar",
+            width=65,
             height=24,
-            command=self.reload_catalog
+            fg_color="gray30",
+            hover_color="gray40",
+            font=ctk.CTkFont(size=10),
+            command=self.clear_history_data
         )
-        btn_reload_cat.pack(side="right")
-
-        self.catalog_scroll = ctk.CTkScrollableFrame(card_catalog, height=180)
-        self.catalog_scroll.pack(fill="both", expand=True, padx=10, pady=(4, 10))
-        self.render_catalog_list()
-
-        # Card 3: Buscador de Consulta en Aktis (Opcional)
-        card_aktis = ctk.CTkFrame(parent, fg_color=("gray85", "gray17"), corner_radius=6)
-        card_aktis.pack(fill="x", padx=12, pady=(6, 12))
-
-        a_header = ctk.CTkFrame(card_aktis, fg_color="transparent")
-        a_header.pack(fill="x", padx=10, pady=(8, 2))
+        btn_clear_hist.pack(side="right")
 
         ctk.CTkLabel(
-            a_header,
-            text="3. Consulta en Aktis (Opcional)",
+            parent,
+            text="Haz clic en cualquier lote para abrir su carpeta o verlo en pantalla:",
+            font=ctk.CTkFont(size=11),
+            text_color="gray"
+        ).pack(anchor="w", padx=12, pady=(0, 6))
+
+        self.history_scroll = ctk.CTkScrollableFrame(parent)
+        self.history_scroll.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.render_history_list([])
+
+    def render_history_list(self, batches: list):
+        for w in self.history_scroll.winfo_children():
+            w.destroy()
+
+        if not batches:
+            lbl_empty = ctk.CTkLabel(
+                self.history_scroll,
+                text="Aún no se ha procesado ningún lote en esta sesión.",
+                text_color="gray"
+            )
+            lbl_empty.pack(pady=30)
+            return
+
+        for b in reversed(batches):
+            card = ctk.CTkFrame(self.history_scroll, fg_color=("gray90", "gray18"), corner_radius=6)
+            card.pack(fill="x", pady=3, padx=2)
+
+            top_row = ctk.CTkFrame(card, fg_color="transparent")
+            top_row.pack(fill="x", padx=8, pady=(6, 2))
+
+            time_badge = ctk.CTkLabel(
+                top_row,
+                text=b.get("time", "--:--"),
+                font=ctk.CTkFont(family="Consolas", size=10, weight="bold"),
+                fg_color="gray30",
+                corner_radius=4,
+                padx=5
+            )
+            time_badge.pack(side="left")
+
+            of_lbl = ctk.CTkLabel(
+                top_row,
+                text=f"OF: {b.get('of', '')}",
+                font=ctk.CTkFont(size=12, weight="bold"),
+                text_color=("#1d4ed8", "#38bdf8")
+            )
+            of_lbl.pack(side="left", padx=6)
+
+            info_row = ctk.CTkFrame(card, fg_color="transparent")
+            info_row.pack(fill="x", padx=8, pady=(0, 4))
+
+            files_count = b.get("files_count", len(b.get("created_files", [])))
+            total_pages = b.get("total_pages", 0)
+            o_info = b.get("order_info", {})
+            odoo = o_info.get("pedido_odoo", "")
+            desc = o_info.get("descripcion", "")
+
+            odoo_tag = f"Odoo: {odoo} | " if odoo else ""
+            desc_tag = f"\n{desc[:40]}" if desc else ""
+            stats_lbl = ctk.CTkLabel(
+                info_row,
+                text=f"{odoo_tag}{files_count} archivos ({total_pages} págs){desc_tag}",
+                font=ctk.CTkFont(size=10),
+                text_color="gray",
+                justify="left",
+                anchor="w"
+            )
+            stats_lbl.pack(side="left", fill="x", expand=True)
+
+            btns_row = ctk.CTkFrame(card, fg_color="transparent")
+            btns_row.pack(fill="x", padx=8, pady=(0, 6))
+
+            btn_open = ctk.CTkButton(
+                btns_row,
+                text="📂 Carpeta",
+                width=80,
+                height=24,
+                font=ctk.CTkFont(size=10, weight="bold"),
+                fg_color="#059669",
+                hover_color="#047857",
+                command=lambda d=b.get("dest_dir", ""): os.startfile(d) if os.path.exists(d) else messagebox.showinfo("Carpeta", f"No disponible: {d}")
+            )
+            btn_open.pack(side="right", padx=(4, 0))
+
+            btn_view = ctk.CTkButton(
+                btns_row,
+                text="👁️ Ver Lote",
+                width=75,
+                height=24,
+                font=ctk.CTkFont(size=10),
+                fg_color=("#3b82f6", "#2563eb"),
+                hover_color=("#1d4ed8", "#1d4ed8"),
+                command=lambda batch=b: self.load_historical_batch_to_view(batch)
+            )
+            btn_view.pack(side="right")
+
+    def load_historical_batch_to_view(self, batch: dict):
+        self.render_batch_summary(batch)
+        self.render_created_files_list(batch.get("created_files", []))
+        self.btn_open_batch_folder.configure(state="normal", fg_color="#059669")
+        self.btn_copy_batch_path.configure(state="normal")
+        self.last_rendered_batch_key = f"{batch.get('of')}_{len(batch.get('created_files', []))}"
+        if batch.get("alert"):
+            self.lbl_alert_msg.configure(text=f"Aviso en lote cargado: {batch['alert']}")
+            if not self.alert_frame.winfo_ismapped():
+                self.alert_frame.pack(fill="x", padx=16, pady=(0, 6), before=self.main_content)
+
+    def clear_history_data(self):
+        if messagebox.askyesno("Vaciar Historial", "¿Deseas vaciar el historial de lotes procesados en esta sesión?"):
+            self.session_manager.batches_history.clear()
+            self.render_history_list([])
+            self.lbl_hist_title.configure(text="Lotes Procesados (0)")
+
+    def setup_aktis_tab(self, tab_aktis):
+        tab_aktis.grid_columnconfigure(0, weight=1)
+
+        ak_header = ctk.CTkFrame(tab_aktis, fg_color="transparent")
+        ak_header.pack(fill="x", padx=10, pady=(8, 4))
+
+        ctk.CTkLabel(
+            ak_header,
+            text="Buscar OF en Pedidos en Curso:",
             font=ctk.CTkFont(size=13, weight="bold")
         ).pack(side="left")
 
         btn_reload_ak = ctk.CTkButton(
-            a_header, text="↻ Recargar Excel", width=95, height=22,
+            ak_header,
+            text="↻ Recargar Excel",
+            width=100,
+            height=24,
             font=ctk.CTkFont(size=11),
             command=self.reload_excel
         )
         btn_reload_ak.pack(side="right")
 
-        search_row = ctk.CTkFrame(card_aktis, fg_color="transparent")
-        search_row.pack(fill="x", padx=10, pady=4)
+        search_row = ctk.CTkFrame(tab_aktis, fg_color="transparent")
+        search_row.pack(fill="x", padx=10, pady=(2, 6))
 
         self.of_entry = ctk.CTkEntry(
             search_row,
-            placeholder_text="Buscar OF (ej: AYC/MO/00560 o 560)...",
-            height=30
+            placeholder_text="Escribe OF (ej: AYC/MO/00560 o 560)...",
+            height=32
         )
         self.of_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
         self.of_entry.bind("<KeyRelease>", self.on_of_search_typing)
         self.of_entry.bind("<Return>", lambda e: self.do_search_of())
 
         btn_search = ctk.CTkButton(
-            search_row, text="Buscar", width=65, height=30,
+            search_row, text="Buscar", width=65, height=32,
             command=self.do_search_of
         )
         btn_search.pack(side="right")
 
-        self.results_frame = ctk.CTkScrollableFrame(card_aktis, height=80)
-        # Pack only on matches
+        self.results_frame = ctk.CTkScrollableFrame(tab_aktis, height=120)
 
-        self.details_box = ctk.CTkFrame(card_aktis, fg_color=("gray90", "gray13"))
-        self.details_box.pack(fill="x", padx=10, pady=(4, 8))
+        self.details_box = ctk.CTkFrame(tab_aktis, fg_color=("gray85", "gray14"), corner_radius=6)
+        self.details_box.pack(fill="both", expand=True, padx=10, pady=6)
 
-        self.lbl_detail_of = ctk.CTkLabel(self.details_box, text="OF: -", font=ctk.CTkFont(weight="bold", size=12))
-        self.lbl_detail_of.grid(row=0, column=0, sticky="w", padx=6, pady=1)
+        ctk.CTkLabel(
+            self.details_box,
+            text="Detalle del Pedido Seleccionado:",
+            font=ctk.CTkFont(size=12, weight="bold")
+        ).pack(anchor="w", padx=12, pady=(10, 4))
 
-        self.lbl_detail_odoo = ctk.CTkLabel(self.details_box, text="Pedido ODOO: -", font=ctk.CTkFont(size=11))
-        self.lbl_detail_odoo.grid(row=0, column=1, sticky="w", padx=6, pady=1)
+        self.lbl_detail_of = ctk.CTkLabel(self.details_box, text="OF: -", font=ctk.CTkFont(weight="bold", size=13))
+        self.lbl_detail_of.pack(anchor="w", padx=12, pady=2)
 
-        self.lbl_detail_desc = ctk.CTkLabel(self.details_box, text="Descripción: -", font=ctk.CTkFont(size=11), wraplength=400, justify="left")
-        self.lbl_detail_desc.grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=1)
+        self.lbl_detail_odoo = ctk.CTkLabel(self.details_box, text="Pedido ODOO: -", font=ctk.CTkFont(size=12))
+        self.lbl_detail_odoo.pack(anchor="w", padx=12, pady=2)
+
+        self.lbl_detail_cliente = ctk.CTkLabel(self.details_box, text="Cliente: -", font=ctk.CTkFont(size=12))
+        self.lbl_detail_cliente.pack(anchor="w", padx=12, pady=2)
+
+        self.lbl_detail_desc = ctk.CTkLabel(
+            self.details_box,
+            text="Descripción: -",
+            font=ctk.CTkFont(size=11),
+            text_color="gray",
+            wraplength=380,
+            justify="left"
+        )
+        self.lbl_detail_desc.pack(anchor="w", padx=12, pady=(2, 10))
+
+    def setup_catalog_tab(self, tab_cat):
+        tab_cat.grid_columnconfigure(0, weight=1)
+
+        cat_header = ctk.CTkFrame(tab_cat, fg_color="transparent")
+        cat_header.pack(fill="x", padx=10, pady=(8, 4))
+
+        self.lbl_catalog_title = ctk.CTkLabel(
+            cat_header,
+            text=f"Catálogo Oficial ({len(self.catalog)} tipos)",
+            font=ctk.CTkFont(size=13, weight="bold")
+        )
+        self.lbl_catalog_title.pack(side="left")
+
+        btn_reload_cat = ctk.CTkButton(
+            cat_header,
+            text="↻ Recargar",
+            width=85,
+            height=24,
+            font=ctk.CTkFont(size=11),
+            command=self.reload_catalog
+        )
+        btn_reload_cat.pack(side="right")
+
+        self.cat_filter_entry = ctk.CTkEntry(
+            tab_cat,
+            placeholder_text="Filtrar por código o nombre de documento...",
+            height=28
+        )
+        self.cat_filter_entry.pack(fill="x", padx=10, pady=(2, 6))
+        self.cat_filter_entry.bind("<KeyRelease>", self.filter_catalog_list)
+
+        self.catalog_scroll = ctk.CTkScrollableFrame(tab_cat)
+        self.catalog_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self.render_catalog_list()
+
+    def filter_catalog_list(self, event=None):
+        q = self.cat_filter_entry.get().strip().lower()
+        if not q:
+            self.filtered_catalog = list(self.catalog)
+        else:
+            self.filtered_catalog = [
+                d for d in self.catalog
+                if q in d.get("codigo", "").lower() or q in d.get("documento", "").lower()
+            ]
+        self.render_catalog_list()
 
     def render_catalog_list(self):
         for w in self.catalog_scroll.winfo_children():
             w.destroy()
 
-        for d in self.catalog:
+        for d in self.filtered_catalog:
             code = d.get("codigo", "")
             doc_name = d.get("documento", "")
             is_inc = d.get("is_incidencia", False)
 
-            row = ctk.CTkFrame(self.catalog_scroll, fg_color=("gray90", "gray19"), height=28)
-            row.pack(fill="x", pady=1, padx=2)
+            row = ctk.CTkFrame(self.catalog_scroll, fg_color=("gray90", "gray18"), height=30)
+            row.pack(fill="x", pady=2, padx=2)
 
-            # Badge del código
-            code_bg = "#dc2626" if is_inc else ("#4338ca" if "ANEXO" in code else "#2563eb")
+            code_bg = "#d97706" if is_inc else ("#4338ca" if "ANEXO" in code else "#2563eb")
             code_badge = ctk.CTkLabel(
                 row,
                 text=code,
                 font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
                 fg_color=code_bg,
+                text_color="white",
                 corner_radius=4,
                 padx=6
             )
-            code_badge.pack(side="left", padx=4, pady=2)
+            code_badge.pack(side="left", padx=5, pady=3)
 
+            tag_inc = " [Incidencia 1-N]" if is_inc else ""
             name_lbl = ctk.CTkLabel(
                 row,
-                text=doc_name + (" [Páginas individuales (1-N)]" if is_inc else ""),
+                text=doc_name + tag_inc,
                 font=ctk.CTkFont(size=11, weight="bold" if is_inc else "normal"),
-                text_color="#f87171" if is_inc else ("black", "white"),
+                text_color="#f59e0b" if is_inc else ("black", "white"),
                 anchor="w"
             )
             name_lbl.pack(side="left", fill="x", expand=True, padx=4)
 
     def reload_catalog(self):
         self.catalog = load_ocr_catalog()
-        self.lbl_catalog_title.configure(text=f"2. Catálogo Oficial ({len(self.catalog)} tipos)")
-        self.render_catalog_list()
+        self.filter_catalog_list()
+        self.lbl_catalog_title.configure(text=f"Catálogo Oficial ({len(self.catalog)} tipos)")
         messagebox.showinfo("Catálogo", f"Se han cargado {len(self.catalog)} tipos de documentos desde codigosOCR.xlsx.")
 
     def setup_right_column(self, parent):
         parent.grid_columnconfigure(0, weight=1)
 
-        # Header 4: Lotes y Monitor
-        header4 = ctk.CTkFrame(parent, fg_color="transparent")
-        header4.pack(fill="x", padx=12, pady=(12, 4))
+        # Encabezado del monitor con botones de acción rápida
+        header_r = ctk.CTkFrame(parent, fg_color="transparent")
+        header_r.pack(fill="x", padx=12, pady=(10, 4))
 
         ctk.CTkLabel(
-            header4,
-            text="Monitor en Tiempo Real y Lotes Procesados",
+            header_r,
+            text="Monitor en Tiempo Real y Lotes",
             font=ctk.CTkFont(size=15, weight="bold")
         ).pack(side="left")
 
+        # Botón Limpiar Vista Visualmente
+        btn_clear_view = ctk.CTkButton(
+            header_r,
+            text="🧹 Limpiar Vista",
+            width=110,
+            height=28,
+            fg_color="gray30",
+            hover_color="gray40",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self.clear_visual_state
+        )
+        btn_clear_view.pack(side="right", padx=(6, 0))
+
+        # Botón Acceso Rápido a Historial
+        btn_go_hist = ctk.CTkButton(
+            header_r,
+            text="📜 Ver Historial",
+            width=110,
+            height=28,
+            fg_color="#3b82f6",
+            hover_color="#2563eb",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=lambda: self.left_tabs.set("📜 Historial")
+        )
+        btn_go_hist.pack(side="right", padx=(6, 0))
+
         self.lbl_batch_counter = ctk.CTkLabel(
-            header4,
+            header_r,
             text="Lotes hoy: 0",
             font=ctk.CTkFont(size=12, weight="bold"),
-            text_color="gray"
+            text_color="#38bdf8"
         )
-        self.lbl_batch_counter.pack(side="right")
+        self.lbl_batch_counter.pack(side="right", padx=6)
 
-        # Card: Último Lote Procesado
-        self.last_batch_card = ctk.CTkFrame(parent, fg_color=("gray85", "gray17"), corner_radius=6)
+        # Tarjeta: Último Lote Procesado
+        self.last_batch_card = ctk.CTkFrame(parent, fg_color=("gray85", "gray17"), corner_radius=8)
         self.last_batch_card.pack(fill="x", padx=12, pady=(4, 6))
 
-        batch_header = ctk.CTkFrame(self.last_batch_card, fg_color="transparent")
-        batch_header.pack(fill="x", padx=12, pady=(10, 4))
+        batch_head = ctk.CTkFrame(self.last_batch_card, fg_color="transparent")
+        batch_head.pack(fill="x", padx=12, pady=(10, 2))
 
         self.lbl_batch_title = ctk.CTkLabel(
-            batch_header,
+            batch_head,
             text="Último Lote: Ninguno procesado todavía",
             font=ctk.CTkFont(size=14, weight="bold")
         )
         self.lbl_batch_title.pack(side="left")
 
+        # Botones de acción rápida del lote
+        self.btn_copy_batch_path = ctk.CTkButton(
+            batch_head,
+            text="📋 Copiar Ruta",
+            height=28,
+            width=100,
+            fg_color="gray30",
+            hover_color="gray40",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self.copy_current_batch_folder
+        )
+        self.btn_copy_batch_path.pack(side="right", padx=(6, 0))
+
         self.btn_open_batch_folder = ctk.CTkButton(
-            batch_header,
-            text="📂 Abrir Carpeta de la OF",
-            height=30,
+            batch_head,
+            text="📂 Abrir Carpeta OF",
+            height=28,
+            width=135,
             fg_color="#059669",
             hover_color="#047857",
             text_color="#ffffff",
-            text_color_disabled="#ffffff",
-            font=ctk.CTkFont(size=12, weight="bold"),
+            font=ctk.CTkFont(size=11, weight="bold"),
             command=self.open_current_batch_folder
         )
         self.btn_open_batch_folder.pack(side="right")
 
         self.lbl_batch_sub = ctk.CTkLabel(
             self.last_batch_card,
-            text="Escucha automática activa. Al colocar un escaneo en la bandeja, se procesará automáticamente.",
+            text="La escucha automática está lista. Al caer un dossier en la bandeja se procesará automáticamente.",
             font=ctk.CTkFont(size=12),
             text_color="gray",
-            justify="left"
+            justify="left",
+            wraplength=600
         )
-        self.lbl_batch_sub.pack(anchor="w", padx=12, pady=(0, 8))
+        self.lbl_batch_sub.pack(anchor="w", padx=12, pady=(0, 10))
 
-        # Panel de Progreso en Vivo (visible mientras se procesa un escaneo)
-        self.progress_frame = ctk.CTkFrame(parent, fg_color=("#dbeafe", "#1e3a5f"), corner_radius=6)
-        # Not packed initially
+        # Barra y panel de Progreso en Vivo
+        self.progress_frame = ctk.CTkFrame(parent, fg_color=("#dbeafe", "#0f2744"), corner_radius=6)
 
         self.lbl_progress_text = ctk.CTkLabel(
             self.progress_frame,
@@ -421,30 +770,107 @@ class VeriDocsDesktopApp(ctk.CTk):
         )
         self.lbl_progress_text.pack(fill="x", padx=12, pady=(8, 4))
 
-        self.progress_bar = ctk.CTkProgressBar(self.progress_frame, height=10, corner_radius=5)
+        self.progress_bar = ctk.CTkProgressBar(self.progress_frame, height=9, corner_radius=5)
         self.progress_bar.pack(fill="x", padx=12, pady=(0, 10))
         self.progress_bar.set(0)
 
-        # Scrollable de Archivos Generados
+        # Lista de Archivos Creados
+        files_header_box = ctk.CTkFrame(parent, fg_color="transparent")
+        files_header_box.pack(fill="x", padx=14, pady=(6, 2))
+
         self.lbl_files_header = ctk.CTkLabel(
-            parent,
+            files_header_box,
             text="Documentos PDF Generados del Lote:",
             font=ctk.CTkFont(size=12, weight="bold")
         )
-        self.lbl_files_header.pack(anchor="w", padx=14, pady=(4, 2))
+        self.lbl_files_header.pack(side="left")
 
-        self.files_scroll = ctk.CTkScrollableFrame(parent, height=260)
+        ctk.CTkLabel(
+            files_header_box,
+            text="(💡 Doble clic en cualquier documento para abrirlo)",
+            font=ctk.CTkFont(size=11),
+            text_color="gray"
+        ).pack(side="left", padx=8)
+
+        self.files_scroll = ctk.CTkScrollableFrame(parent, height=220)
         self.files_scroll.pack(fill="both", expand=True, padx=12, pady=(0, 6))
 
-        # Log de eventos
+        # Consola de Eventos (CTkTextbox para máximo rendimiento y cero parpadeo)
+        log_header_box = ctk.CTkFrame(parent, fg_color="transparent")
+        log_header_box.pack(fill="x", padx=14, pady=(4, 2))
+
         ctk.CTkLabel(
-            parent,
+            log_header_box,
             text="Registro de Actividad en Directo:",
             font=ctk.CTkFont(size=12, weight="bold")
-        ).pack(anchor="w", padx=14, pady=(4, 2))
+        ).pack(side="left")
 
-        self.log_scroll = ctk.CTkScrollableFrame(parent, height=130)
-        self.log_scroll.pack(fill="x", padx=12, pady=(0, 10))
+        btn_copy_log = ctk.CTkButton(
+            log_header_box,
+            text="📋 Copiar",
+            width=65,
+            height=22,
+            font=ctk.CTkFont(size=10),
+            fg_color="gray30",
+            hover_color="gray40",
+            command=self.copy_log_to_clipboard
+        )
+        btn_copy_log.pack(side="right", padx=(4, 0))
+
+        btn_clear_log = ctk.CTkButton(
+            log_header_box,
+            text="🗑️ Limpiar",
+            width=65,
+            height=22,
+            font=ctk.CTkFont(size=10),
+            fg_color="gray30",
+            hover_color="gray40",
+            command=self.clear_log_console
+        )
+        btn_clear_log.pack(side="right")
+
+        self.log_textbox = ctk.CTkTextbox(
+            parent,
+            height=140,
+            font=ctk.CTkFont(family="Consolas", size=10),
+            activate_scrollbars=True
+        )
+        self.log_textbox.pack(fill="x", padx=12, pady=(0, 10))
+
+        self.log_textbox.tag_config("SUCCESS", foreground="#10b981")
+        self.log_textbox.tag_config("WARNING", foreground="#f59e0b")
+        self.log_textbox.tag_config("ERROR", foreground="#ef4444")
+        self.log_textbox.tag_config("INFO", foreground="#94a3b8")
+
+    def clear_visual_state(self):
+        """Limpia todo lo que se ha mostrado visualmente en pantalla (resetea vista)."""
+        self.lbl_batch_title.configure(text="Último Lote: Vista restablecida")
+        self.lbl_batch_sub.configure(text="Pantalla limpiada. La escucha sigue activa y el próximo escaneo se mostrará aquí.")
+        self.btn_open_batch_folder.configure(state="disabled", fg_color="gray30")
+        self.btn_copy_batch_path.configure(state="disabled")
+
+        for w in self.files_scroll.winfo_children():
+            w.destroy()
+        lbl_empty = ctk.CTkLabel(
+            self.files_scroll,
+            text="Vista limpia. Los documentos del próximo escaneo aparecerán aquí.",
+            text_color="gray"
+        )
+        lbl_empty.pack(pady=20)
+        self.lbl_files_header.configure(text="Documentos PDF Generados del Lote:")
+
+        if self.progress_frame.winfo_ismapped():
+            self.progress_frame.pack_forget()
+
+        self.log_textbox.delete("1.0", "end")
+        self.seen_log_count = 0
+
+        if self.alert_frame.winfo_ismapped():
+            self.alert_frame.pack_forget()
+        self.current_alert_data = None
+
+        self.last_rendered_batch_key = None
+        self.last_rendered_live_count = -1
 
     def toggle_listening(self):
         if not self.session_manager.active:
@@ -454,8 +880,7 @@ class VeriDocsDesktopApp(ctk.CTk):
                 self.btn_toggle_listen.configure(
                     text="⏹ DETENER ESCUCHA",
                     fg_color="#ef4444",
-                    hover_color="#dc2626",
-                    text_color="#ffffff"
+                    hover_color="#dc2626"
                 )
             else:
                 messagebox.showerror("Error al iniciar", msg)
@@ -465,9 +890,16 @@ class VeriDocsDesktopApp(ctk.CTk):
             self.btn_toggle_listen.configure(
                 text="▶ INICIAR ESCUCHA AUTOMÁTICA",
                 fg_color="#059669",
-                hover_color="#047857",
-                text_color="#ffffff"
+                hover_color="#047857"
             )
+
+    def open_scans_folder(self):
+        cfg = load_config()
+        folder = cfg.get("escaneos_folder", "")
+        if os.path.exists(folder):
+            os.startfile(folder)
+        else:
+            messagebox.showinfo("Bandeja", f"La carpeta de escaneos no está accesible:\n{folder}")
 
     def process_pdf_manually(self):
         file_path = filedialog.askopenfilename(
@@ -528,7 +960,14 @@ class VeriDocsDesktopApp(ctk.CTk):
                         level="warning",
                         dest_dir=res["destination_dir"]
                     )
-                self.after(0, lambda: messagebox.showinfo("Éxito", f"Lote de la OF '{res['of']}' procesado con éxito.\nSe han creado {len(res['created_files'])} archivos PDF."))
+                show_system_notification(
+                    f"OF {res['of']} procesada con éxito",
+                    f"Se han generado {len(res['created_files'])} archivos PDF."
+                )
+                self.after(0, lambda: messagebox.showinfo(
+                    "Éxito",
+                    f"Lote de la OF '{res['of']}' procesado con éxito.\nSe han creado {len(res['created_files'])} archivos PDF."
+                ))
             else:
                 err = res.get("error", "Error desconocido")
                 self.session_manager.add_alert(
@@ -536,35 +975,35 @@ class VeriDocsDesktopApp(ctk.CTk):
                     message=err,
                     level="error"
                 )
+                show_system_notification("Error en procesamiento", err, is_error=True)
                 self.after(0, lambda: messagebox.showerror("Error", err))
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def poll_session_status(self):
+        """Sondeo periódico sin parpadeos ni fugas de rendimiento."""
         try:
             status = self.session_manager.get_status()
 
-            # Actualizar botón según estado real
+            # 1. Estado del botón según el estado real
             if status["active"]:
                 self.lbl_session_badge.configure(text="ESCUCHANDO BANDEJA", fg_color="#10b981")
                 self.btn_toggle_listen.configure(
                     text="⏹ DETENER ESCUCHA",
                     fg_color="#ef4444",
-                    hover_color="#dc2626",
-                    text_color="#ffffff"
+                    hover_color="#dc2626"
                 )
             else:
                 self.lbl_session_badge.configure(text="INACTIVO", fg_color="gray30")
                 self.btn_toggle_listen.configure(
                     text="▶ INICIAR ESCUCHA AUTOMÁTICA",
                     fg_color="#059669",
-                    hover_color="#047857",
-                    text_color="#ffffff"
+                    hover_color="#047857"
                 )
 
-            self.lbl_batch_counter.configure(text=f"Lotes procesados: {status['total_batches_processed']}")
+            self.lbl_batch_counter.configure(text=f"Lotes procesados hoy: {status['total_batches_processed']}")
 
-            # Manejar alertas activas
+            # 2. Manejar alertas activas
             active_alerts = status.get("active_alerts", [])
             if active_alerts:
                 latest_alert = active_alerts[-1]
@@ -576,13 +1015,13 @@ class VeriDocsDesktopApp(ctk.CTk):
                 if self.alert_frame.winfo_ismapped():
                     self.alert_frame.pack_forget()
 
-            # Progreso en tiempo real si hay un escaneo en curso
+            # 3. Barra de progreso en vivo
             curr_prog = status.get("current_progress", {})
             is_proc = curr_prog.get("is_processing", False)
 
             if is_proc:
                 if not self.progress_frame.winfo_ismapped():
-                    self.progress_frame.pack(fill="x", padx=12, pady=(0, 6), before=self.lbl_files_header)
+                    self.progress_frame.pack(fill="x", padx=12, pady=(0, 6), before=self.lbl_files_header.master)
 
                 p_file = curr_prog.get("filename", "")
                 p_of = curr_prog.get("of", "")
@@ -596,117 +1035,178 @@ class VeriDocsDesktopApp(ctk.CTk):
                 )
                 self.progress_bar.set(min(1.0, c_p / float(t_p)))
 
-                # Renderizar los archivos creados EN DIRECTO a medida que se van generando
                 live_files = curr_prog.get("created_files", [])
-                current_widgets = len(self.files_scroll.winfo_children())
-                if current_widgets != len(live_files):
-                    for w in self.files_scroll.winfo_children():
-                        w.destroy()
-
-                    for f in live_files:
-                        is_warn = f.get("is_warning", False)
-                        card_bg = ("#fee2e2", "#450a0a") if is_warn else ("gray90", "gray19")
-                        card = ctk.CTkFrame(self.files_scroll, fg_color=card_bg, height=42)
-                        card.pack(fill="x", pady=2, padx=2)
-
-                        icon = "⚠️ " if is_warn else "📄 "
-                        pages_tag = f"  [Págs: {f.get('pages_list', [])}]"
-                        doc_lbl = ctk.CTkLabel(
-                            card,
-                            text=f"{icon}{f.get('doc_name', '')}{pages_tag}",
-                            font=ctk.CTkFont(weight="bold", size=12),
-                            text_color="#ef4444" if is_warn else ("black", "white")
-                        )
-                        doc_lbl.pack(anchor="w", padx=8, pady=(3, 0))
-
-                        file_lbl = ctk.CTkLabel(
-                            card,
-                            text=f.get("filename", ""),
-                            font=ctk.CTkFont(family="Consolas", size=10),
-                            text_color="gray"
-                        )
-                        file_lbl.pack(anchor="w", padx=8, pady=(0, 3))
+                if len(live_files) != self.last_rendered_live_count:
+                    self.last_rendered_live_count = len(live_files)
+                    self.render_created_files_list(live_files)
             else:
                 if self.progress_frame.winfo_ismapped():
                     self.progress_frame.pack_forget()
 
-                # Renderizar último lote procesado si ha cambiado
                 last_b = status.get("last_batch")
                 if last_b:
-                    of_str = last_b.get("of", "")
-                    o_info = last_b.get("order_info", {})
-                    col_e = o_info.get("pedido_odoo", "")
-                    col_i = o_info.get("descripcion", "")
-                    dest_dir = last_b.get("destination_dir", "")
+                    batch_key = f"{last_b.get('of')}_{len(last_b.get('created_files', []))}_{last_b.get('destination_dir')}"
+                    if batch_key != self.last_rendered_batch_key:
+                        self.last_rendered_batch_key = batch_key
+                        self.render_batch_summary(last_b)
+                        self.render_created_files_list(last_b.get("created_files", []))
+                        self.btn_open_batch_folder.configure(state="normal", fg_color="#059669")
+                        self.btn_copy_batch_path.configure(state="normal")
 
-                    title_text = f"OF: {of_str}  |  Odoo: {col_e or '(N/A)'}  |  Total: {last_b.get('total_pages', 0)} páginas"
-                    self.lbl_batch_title.configure(text=title_text)
-                    self.lbl_batch_sub.configure(
-                        text=f"Descripción: {col_i or '(Sin descripción)'}\nCarpeta: {dest_dir}"
-                    )
-                    self.btn_open_batch_folder.configure(
-                        state="normal",
-                        fg_color="#059669",
-                        hover_color="#047857",
-                        text_color="#ffffff"
-                    )
+            # 4. Actualizar historial de lotes si ha cambiado
+            batches = status.get("batches_history", [])
+            if len(batches) != self.seen_batches_count:
+                self.seen_batches_count = len(batches)
+                self.lbl_hist_title.configure(text=f"Lotes Procesados ({len(batches)})")
+                self.render_history_list(batches)
 
-                    # Renderizar archivos creados si es la primera vez que vemos este lote
-                    created_files = last_b.get("created_files", [])
-                    current_widgets = len(self.files_scroll.winfo_children())
-                    if current_widgets != len(created_files):
-                        for w in self.files_scroll.winfo_children():
-                            w.destroy()
-
-                        for f in created_files:
-                            is_warn = f.get("is_warning", False)
-                            card_bg = ("#fee2e2", "#450a0a") if is_warn else ("gray90", "gray19")
-                            card = ctk.CTkFrame(self.files_scroll, fg_color=card_bg, height=42)
-                            card.pack(fill="x", pady=2, padx=2)
-
-                            icon = "⚠️ " if is_warn else "📄 "
-                            pages_tag = f"  [Págs: {f.get('pages_list', [])}]"
-                            doc_lbl = ctk.CTkLabel(
-                                card,
-                                text=f"{icon}{f.get('doc_name', '')}{pages_tag}",
-                                font=ctk.CTkFont(weight="bold", size=12),
-                                text_color="#ef4444" if is_warn else ("black", "white")
-                            )
-                            doc_lbl.pack(anchor="w", padx=8, pady=(3, 0))
-
-                            file_lbl = ctk.CTkLabel(
-                                card,
-                                text=f.get("filename", ""),
-                                font=ctk.CTkFont(family="Consolas", size=10),
-                                text_color="gray"
-                            )
-                            file_lbl.pack(anchor="w", padx=8, pady=(0, 3))
-
-            # Renderizar últimos logs
-            logs = status.get("events_log", [])
-            if len(self.log_scroll.winfo_children()) != len(logs):
-                for w in self.log_scroll.winfo_children():
-                    w.destroy()
-                for entry in logs:
-                    t = entry.get("time", "")
-                    m = entry.get("message", "")
-                    lvl = entry.get("level", "info")
-
-                    color = "#10b981" if lvl == "success" else ("#f59e0b" if lvl == "warning" else ("#ef4444" if lvl == "error" else "gray"))
-                    row = ctk.CTkLabel(
-                        self.log_scroll,
-                        text=f"[{t}] {m}",
-                        font=ctk.CTkFont(family="Consolas", size=10),
-                        text_color=color,
-                        anchor="w"
-                    )
-                    row.pack(fill="x", pady=1, padx=4)
+            # 5. Actualizar consola de registro incrementalmente (sin recrear widgets)
+            events = status.get("events_log", [])
+            if len(events) > self.seen_log_count:
+                new_events = events[self.seen_log_count:]
+                for ev in new_events:
+                    t = ev.get("time", "")
+                    m = ev.get("message", "")
+                    lvl = ev.get("level", "info").upper()
+                    tag = lvl if lvl in ("SUCCESS", "WARNING", "ERROR") else "INFO"
+                    line = f"[{t}] [{lvl}] {m}\n"
+                    self.log_textbox.insert("end", line, tag)
+                self.seen_log_count = len(events)
+                self.log_textbox.see("end")
 
         except Exception as e:
             print(f"[poll_session_status] Error: {e}")
         finally:
-            # Reprogramar siguiente comprobación de forma garantizada
             self.after(1000, self.poll_session_status)
+
+    def render_batch_summary(self, last_b: dict):
+        of_str = last_b.get("of", "")
+        o_info = last_b.get("order_info", {})
+        col_e = o_info.get("pedido_odoo", "")
+        col_i = o_info.get("descripcion", "")
+        col_cli = o_info.get("cliente", "")
+        dest_dir = last_b.get("destination_dir", "")
+        t_pages = last_b.get("total_pages", 0)
+
+        title_text = f"OF: {of_str}  |  Odoo: {col_e or '(N/A)'}  |  Total: {t_pages} páginas"
+        self.lbl_batch_title.configure(text=title_text)
+
+        cli_tag = f"  |  Cliente: {col_cli}" if col_cli else ""
+        desc_tag = f"Descripción: {col_i or '(Sin descripción)'}{cli_tag}"
+        self.lbl_batch_sub.configure(text=f"{desc_tag}\nCarpeta: {dest_dir}")
+
+    def render_created_files_list(self, files: list):
+        """Renderiza las tarjetas de archivos generados con opción de apertura por doble clic."""
+        for w in self.files_scroll.winfo_children():
+            w.destroy()
+
+        if not files:
+            lbl_empty = ctk.CTkLabel(
+                self.files_scroll,
+                text="Los archivos troceados aparecerán aquí conforme se generen.",
+                text_color="gray"
+            )
+            lbl_empty.pack(pady=20)
+            self.lbl_files_header.configure(text="Documentos PDF Generados del Lote:")
+            return
+
+        self.lbl_files_header.configure(text=f"Documentos PDF Generados del Lote ({len(files)} archivos):")
+
+        for f in files:
+            is_warn = f.get("is_warning", False)
+            f_path = f.get("path", "")
+            f_name = f.get("filename", "")
+            doc_n = f.get("doc_name", "")
+            pages = f.get("pages_list", [])
+
+            card_bg = ("#fef3c7", "#3b1d06") if is_warn else ("gray90", "gray18")
+            card = ctk.CTkFrame(self.files_scroll, fg_color=card_bg, height=44, corner_radius=6)
+            card.pack(fill="x", pady=2, padx=2)
+
+            icon = "⚠️ " if is_warn else "📄 "
+            pages_tag = f"  [Págs: {pages}]" if pages else ""
+
+            info_box = ctk.CTkFrame(card, fg_color="transparent")
+            info_box.pack(side="left", fill="both", expand=True, padx=8, pady=4)
+
+            title_c = ctk.CTkLabel(
+                info_box,
+                text=f"{icon}{doc_n}{pages_tag}",
+                font=ctk.CTkFont(weight="bold", size=12),
+                text_color="#f59e0b" if is_warn else ("black", "white"),
+                anchor="w"
+            )
+            title_c.pack(anchor="w")
+
+            file_c = ctk.CTkLabel(
+                info_box,
+                text=f_name,
+                font=ctk.CTkFont(family="Consolas", size=10),
+                text_color="gray",
+                anchor="w"
+            )
+            file_c.pack(anchor="w")
+
+            actions_box = ctk.CTkFrame(card, fg_color="transparent")
+            actions_box.pack(side="right", padx=6)
+
+            btn_copy_f = ctk.CTkButton(
+                actions_box,
+                text="📋 Copiar",
+                width=65,
+                height=26,
+                fg_color="gray30",
+                hover_color="gray40",
+                font=ctk.CTkFont(size=10),
+                command=lambda p=f_path: copy_to_clipboard(self, p)
+            )
+            btn_copy_f.pack(side="right", padx=2)
+
+            btn_open_f = ctk.CTkButton(
+                actions_box,
+                text="👁️ Abrir",
+                width=65,
+                height=26,
+                fg_color=("#3b82f6", "#2563eb"),
+                hover_color=("#1d4ed8", "#1d4ed8"),
+                font=ctk.CTkFont(size=10, weight="bold"),
+                command=lambda p=f_path: self.open_file_path(p)
+            )
+            btn_open_f.pack(side="right", padx=2)
+
+            card.bind("<Double-Button-1>", lambda e, p=f_path: self.open_file_path(p))
+            title_c.bind("<Double-Button-1>", lambda e, p=f_path: self.open_file_path(p))
+            file_c.bind("<Double-Button-1>", lambda e, p=f_path: self.open_file_path(p))
+
+    def open_file_path(self, fpath: str):
+        if fpath and os.path.exists(fpath):
+            try:
+                os.startfile(fpath)
+            except Exception as e:
+                messagebox.showerror("Error", f"No se pudo abrir el archivo:\n{e}")
+        else:
+            messagebox.showinfo("Aviso", f"El archivo ya no está disponible en la ruta especificada:\n{fpath}")
+
+    def copy_current_batch_folder(self):
+        status = self.session_manager.get_status()
+        last_b = status.get("last_batch")
+        if last_b and last_b.get("destination_dir"):
+            copy_to_clipboard(self, last_b["destination_dir"], self.btn_copy_batch_path)
+
+    def open_current_batch_folder(self):
+        status = self.session_manager.get_status()
+        last_b = status.get("last_batch")
+        if last_b and last_b.get("destination_dir"):
+            folder = last_b["destination_dir"]
+            if os.path.exists(folder):
+                os.startfile(folder)
+            else:
+                messagebox.showinfo("Aviso", f"La carpeta aún no está disponible: {folder}")
+        else:
+            messagebox.showinfo(
+                "Información",
+                "Aún no se ha procesado ningún lote de escaneo en esta sesión.\n\nEn cuanto se procese un dossier, podrás abrir su carpeta directamente desde aquí."
+            )
 
     def dismiss_current_alert(self):
         if self.current_alert_data:
@@ -721,21 +1221,17 @@ class VeriDocsDesktopApp(ctk.CTk):
             if os.path.exists(folder):
                 os.startfile(folder)
             else:
-                messagebox.showinfo("Aviso", f"La carpeta aún no está disponible: {folder}")
+                messagebox.showinfo("Aviso", f"La carpeta no está accesible: {folder}")
 
-    def open_current_batch_folder(self):
-        status = self.session_manager.get_status()
-        last_b = status.get("last_batch")
-        if last_b and last_b.get("destination_dir"):
-            folder = last_b["destination_dir"]
-            if os.path.exists(folder):
-                os.startfile(folder)
-            else:
-                messagebox.showinfo("Aviso", f"La carpeta no existe: {folder}")
-        else:
-            messagebox.showinfo("Información", "Aún no se ha procesado ningún lote de escaneo en esta sesión.\n\nEn cuanto se procese un dossier, podrás abrir su carpeta directamente desde aquí.")
+    def copy_log_to_clipboard(self):
+        content = self.log_textbox.get("1.0", "end-1c")
+        copy_to_clipboard(self, content)
+        messagebox.showinfo("Registro", "El registro de actividad ha sido copiado al portapapeles.")
 
-    # Búsqueda de OF en Aktis (Opcional para consulta)
+    def clear_log_console(self):
+        self.log_textbox.delete("1.0", "end")
+
+    # Búsqueda de pedidos en Aktis
     def on_of_search_typing(self, event=None):
         if event and event.keysym in ("Return", "KP_Enter", "Up", "Down"):
             return
@@ -788,7 +1284,7 @@ class VeriDocsDesktopApp(ctk.CTk):
                 fg_color="transparent",
                 hover_color=("gray75", "gray25"),
                 text_color=("black", "white"),
-                height=24,
+                height=26,
                 command=lambda order=m: self.select_order(order)
             )
             btn.pack(fill="x", pady=1)
@@ -803,6 +1299,7 @@ class VeriDocsDesktopApp(ctk.CTk):
 
         self.lbl_detail_of.configure(text=f"OF: {order['of']}")
         self.lbl_detail_odoo.configure(text=f"Pedido ODOO: {order['pedido_odoo'] or '(Vacío)'}")
+        self.lbl_detail_cliente.configure(text=f"Cliente: {order.get('cliente', '') or '(No especificado)'}")
         self.lbl_detail_desc.configure(text=f"Descripción: {order['descripcion'] or '(Sin descripción)'}")
 
     def reload_excel(self):
@@ -813,37 +1310,68 @@ class VeriDocsDesktopApp(ctk.CTk):
         threading.Thread(target=_reload, daemon=True).start()
 
     def check_system_connectivity(self):
-        cfg = load_config()
-        excel_path = cfg.get("excel_path", "")
-        escaneos_folder = cfg.get("escaneos_folder", "")
+        """Comprobación de conectividad a redes de forma asíncrona para evitar que la UI se cuelgue."""
+        def _worker():
+            cfg = load_config()
+            excel_path = cfg.get("excel_path", "")
+            escaneos_folder = cfg.get("escaneos_folder", "")
 
-        ex_ok = os.path.exists(excel_path)
-        fo_ok = os.path.exists(escaneos_folder)
+            try:
+                ex_ok = bool(excel_path and os.path.exists(excel_path))
+            except Exception:
+                ex_ok = False
 
-        self.lbl_excel_status.configure(
-            text="Excel: Conectado" if ex_ok else "Excel: No accesible",
-            text_color="#10b981" if ex_ok else "#ef4444"
+            try:
+                fo_ok = bool(escaneos_folder and os.path.exists(escaneos_folder))
+            except Exception:
+                fo_ok = False
+
+            ocr_ok, _ = is_ocr_available()
+            ocr_en = cfg.get("ocr_enabled", True)
+
+            try:
+                self.after(0, lambda: self._apply_connectivity_ui(ex_ok, fo_ok, ocr_ok, ocr_en))
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_connectivity_ui(self, ex_ok: bool, fo_ok: bool, ocr_ok: bool, ocr_en: bool):
+        self.pill_excel.configure(
+            text="● Excel: Conectado" if ex_ok else "● Excel: No accesible",
+            fg_color="#064e3b" if ex_ok else "#7f1d1d",
+            text_color="#34d399" if ex_ok else "#fca5a5"
         )
-        self.lbl_folder_status.configure(
-            text="Escaneos: OK" if fo_ok else "Escaneos: No accesible",
-            text_color="#10b981" if fo_ok else "#ef4444"
+        self.pill_folder.configure(
+            text="● Bandeja: OK" if fo_ok else "● Bandeja: No accesible",
+            fg_color="#064e3b" if fo_ok else "#7f1d1d",
+            text_color="#34d399" if fo_ok else "#fca5a5"
         )
-
-        ocr_ok, _ = is_ocr_available()
-        ocr_en = cfg.get("ocr_enabled", True)
         if not ocr_ok:
-            self.lbl_ocr_status.configure(text="OCR: No disp.", text_color="#ef4444")
+            self.pill_ocr.configure(
+                text="● OCR: No disp.",
+                fg_color="#7f1d1d",
+                text_color="#fca5a5"
+            )
         elif not ocr_en:
-            self.lbl_ocr_status.configure(text="OCR: Inactivo", text_color="#f59e0b")
+            self.pill_ocr.configure(
+                text="● OCR: Inactivo",
+                fg_color="#78350f",
+                text_color="#fcd34d"
+            )
         else:
-            self.lbl_ocr_status.configure(text="OCR: Activo", text_color="#10b981")
+            self.pill_ocr.configure(
+                text="● OCR: Activo",
+                fg_color="#064e3b",
+                text_color="#34d399"
+            )
 
     def open_settings_dialog(self):
         cfg = load_config()
         dlg = ctk.CTkToplevel(self)
         dlg.title("Configuración de VeriDocs")
-        dlg.geometry("640x520")
-        dlg.minsize(550, 480)
+        dlg.geometry("640x590")
+        dlg.minsize(550, 540)
         dlg.grab_set()
 
         tabview = ctk.CTkTabview(dlg)
@@ -853,20 +1381,34 @@ class VeriDocsDesktopApp(ctk.CTk):
         tab_ocr = tabview.add("🔍 Parámetros OCR")
 
         # --- TAB 1: RUTAS ---
-        ctk.CTkLabel(tab_paths, text="Ruta del archivo Excel (Pedidos en curso):", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(8, 2))
+        ctk.CTkLabel(tab_paths, text="Ruta del archivo Excel (Pedidos en curso Aktis):", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(8, 2))
         entry_excel = ctk.CTkEntry(tab_paths, width=580)
         entry_excel.insert(0, cfg.get("excel_path", ""))
         entry_excel.pack(fill="x", pady=(0, 10))
 
-        ctk.CTkLabel(tab_paths, text="Carpeta donde caen los PDFs del escáner:", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(4, 2))
+        ctk.CTkLabel(tab_paths, text="Carpeta de entrada (bandeja de escaneos):", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(4, 2))
         entry_scan = ctk.CTkEntry(tab_paths, width=580)
         entry_scan.insert(0, cfg.get("escaneos_folder", ""))
         entry_scan.pack(fill="x", pady=(0, 10))
 
-        ctk.CTkLabel(tab_paths, text="Carpeta base de destino (donde se crea la carpeta de la OF):", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(4, 2))
+        ctk.CTkLabel(tab_paths, text="Carpeta base de destino (donde se crearán las carpetas de las OFs):", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(4, 2))
         entry_dest = ctk.CTkEntry(tab_paths, width=580)
         entry_dest.insert(0, cfg.get("destination_base_folder", ""))
         entry_dest.pack(fill="x", pady=(0, 10))
+
+        ctk.CTkLabel(tab_paths, text="Carpeta base de Oficina Técnica (red de proyectos):", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(4, 2))
+        entry_ot = ctk.CTkEntry(tab_paths, width=580)
+        entry_ot.insert(0, cfg.get("oficina_tecnica_base", r"\\172.30.0.10\Oficina_tecnica"))
+        entry_ot.pack(fill="x", pady=(0, 10))
+
+        copy_ot_var = ctk.BooleanVar(value=cfg.get("copy_to_oficina_tecnica", True))
+        chk_ot = ctk.CTkSwitch(
+            tab_paths,
+            text="Replicar copia automáticamente en '05-Documentacion final' de Oficina Técnica",
+            variable=copy_ot_var,
+            font=ctk.CTkFont(weight="bold")
+        )
+        chk_ot.pack(anchor="w", pady=(6, 10))
 
         # --- TAB 2: OCR ---
         ocr_enabled_var = ctk.BooleanVar(value=cfg.get("ocr_enabled", True))
@@ -894,12 +1436,12 @@ class VeriDocsDesktopApp(ctk.CTk):
         entry_h.pack(side="left")
         ctk.CTkLabel(row_h, text="(Recomendado: 12% - 15%)", text_color="gray").pack(side="left", padx=8)
 
-        ctk.CTkLabel(tab_ocr, text="Ruta del Excel de códigos oficiales:", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(10, 2))
+        ctk.CTkLabel(tab_ocr, text="Ruta del Excel de códigos oficiales (codigosOCR.xlsx):", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(10, 2))
         entry_cat = ctk.CTkEntry(tab_ocr, width=580)
         entry_cat.insert(0, cfg.get("ocr_catalog_path", "codigosOCR.xlsx"))
         entry_cat.pack(fill="x", pady=(0, 10))
 
-        # Action Buttons
+        # Botones de Acción
         btn_box = ctk.CTkFrame(dlg, fg_color="transparent")
         btn_box.pack(fill="x", padx=16, pady=(0, 14))
 
@@ -918,6 +1460,8 @@ class VeriDocsDesktopApp(ctk.CTk):
                 "excel_path": entry_excel.get().strip(),
                 "escaneos_folder": entry_scan.get().strip(),
                 "destination_base_folder": entry_dest.get().strip(),
+                "oficina_tecnica_base": entry_ot.get().strip(),
+                "copy_to_oficina_tecnica": copy_ot_var.get(),
                 "ocr_enabled": ocr_enabled_var.get(),
                 "ocr_header_height_percent": head_val,
                 "ocr_footer_height_percent": foot_val,

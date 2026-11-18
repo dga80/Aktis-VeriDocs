@@ -3,6 +3,8 @@
     "excel_sheet": "Listado",
     "escaneos_folder": "\\\\Mes-verificacio\\escaneos",
     "destination_base_folder": "\\\\Mes-verificacio\\escaneos",
+    "oficina_tecnica_base": "\\\\172.30.0.10\\Oficina_tecnica",
+    "copy_to_oficina_tecnica": true,
     "ocr_catalog_path": "codigosOCR.xlsx",
     "web_port": 5055,
     "web_host": "0.0.0.0",

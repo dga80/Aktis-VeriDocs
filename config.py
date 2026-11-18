@@ -1,13 +1,21 @@
 import os
+import sys
 import json
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+def get_base_dir():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+CONFIG_FILE = os.path.join(get_base_dir(), "config.json")
 
 DEFAULT_CONFIG = {
     "excel_path": r"\\172.30.0.10\Oficina_tecnica\99-PEDIDOS EN CURSO AKTIS\LISTADO PEDIDOS EN CURSO AKTIS.xlsm",
     "excel_sheet": "Listado",
     "escaneos_folder": r"\\Mes-verificacio\escaneos",
     "destination_base_folder": r"\\Mes-verificacio\escaneos",
+    "oficina_tecnica_base": r"\\172.30.0.10\Oficina_tecnica",
+    "copy_to_oficina_tecnica": True,
     "ocr_catalog_path": "codigosOCR.xlsx",
     "web_port": 5055,
     "web_host": "0.0.0.0",
@@ -19,9 +27,15 @@ DEFAULT_CONFIG = {
 }
 
 def load_config():
-    if os.path.exists(CONFIG_FILE):
+    target_file = CONFIG_FILE
+    if not os.path.exists(target_file):
+        internal_file = os.path.join(get_base_dir(), "_internal", "config.json")
+        if os.path.exists(internal_file):
+            target_file = internal_file
+
+    if os.path.exists(target_file):
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            with open(target_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 config = DEFAULT_CONFIG.copy()
                 config.update(data)
