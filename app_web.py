@@ -1,20 +1,26 @@
 import os
 import sys
+import time
 import socket
+import tempfile
 import subprocess
 import webbrowser
 import threading
-from flask import Flask, render_template, request, jsonify
+from werkzeug.utils import secure_filename
+from flask import Flask, render_template, request, jsonify, send_file
 from config import load_config, save_config
 from veridocs_core import (
     ExcelManager,
     ScanningSession,
     load_ocr_catalog,
-    process_scanned_pdf
+    process_scanned_pdf,
+    to_windows_long_path
 )
 from ocr_service import is_ocr_available, extract_of_from_header, extract_footer_text, match_footer_code
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100 MB máximo para escaneos
+
 excel_manager = ExcelManager()
 session_manager = ScanningSession(excel_manager)
 
@@ -41,10 +47,12 @@ def system_info():
     excel_path = cfg.get("excel_path", "")
     escaneos_folder = cfg.get("escaneos_folder", "")
     dest_folder = cfg.get("destination_base_folder", "")
+    ot_base = cfg.get("oficina_tecnica_base", r"\\172.30.0.10\Oficina_tecnica")
 
     excel_ok = os.path.exists(excel_path)
     escaneos_ok = os.path.exists(escaneos_folder)
     dest_ok = os.path.exists(dest_folder)
+    ot_ok = os.path.exists(ot_base)
 
     pending_pdfs = []
     if escaneos_ok:
@@ -69,6 +77,10 @@ def system_info():
         "escaneos_ok": escaneos_ok,
         "destination_base_folder": dest_folder,
         "destination_ok": dest_ok,
+        "oficina_tecnica_base": ot_base,
+        "oficina_tecnica_ok": ot_ok,
+        "copy_to_oficina_tecnica": cfg.get("copy_to_oficina_tecnica", True),
+        "duplex_mode": cfg.get("duplex_mode", True),
         "pending_scans_in_folder": pending_pdfs,
         "pending_count": len(pending_pdfs),
         "ocr_available": ocr_ok,
@@ -89,6 +101,12 @@ def get_catalog():
 def session_status():
     status = session_manager.get_status()
     return jsonify(status)
+
+
+@app.route("/api/batches", methods=["GET"])
+def get_batches():
+    status = session_manager.get_status()
+    return jsonify(status.get("batches_history", []))
 
 
 @app.route("/api/watcher/toggle", methods=["POST"])
@@ -116,10 +134,46 @@ def stop_watcher():
 def dismiss_alert():
     data = request.json or {}
     alert_id = data.get("id")
-    if alert_id:
-        session_manager.dismiss_alert(alert_id)
+    if alert_id is not None:
+        session_manager.dismiss_alert(int(alert_id))
         return jsonify({"success": True})
     return jsonify({"success": False, "error": "ID de alerta no proporcionado"}), 400
+
+
+@app.route("/api/alerts/clear_all", methods=["POST"])
+def clear_all_alerts():
+    session_manager.clear_alerts()
+    return jsonify({"success": True})
+
+
+@app.route("/api/session/open_folder", methods=["POST"])
+def open_session_folder():
+    data = request.json or {}
+    target_dir = data.get("folder")
+    if not target_dir:
+        status = session_manager.get_status()
+        last_b = status.get("last_batch")
+        if last_b:
+            target_dir = last_b.get("destination_dir") or last_b.get("dest_dir")
+
+    if target_dir and os.path.exists(target_dir):
+        try:
+            os.startfile(target_dir)
+            return jsonify({"success": True, "folder": target_dir})
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)}), 500
+    return jsonify({"success": False, "error": f"Carpeta no accesible en el servidor: {target_dir}"}), 404
+
+
+@app.route("/api/files/download", methods=["GET"])
+def download_generated_file():
+    filepath = request.args.get("path", "").strip()
+    if not filepath or not os.path.exists(filepath):
+        return jsonify({"error": "Archivo no encontrado"}), 404
+    try:
+        return send_file(filepath, as_attachment=False)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/orders", methods=["GET"])
@@ -141,26 +195,14 @@ def process_pdf_upload():
     if not file:
         return jsonify({"success": False, "error": "No se ha subido ningún archivo PDF."}), 400
 
-    temp_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"temp_upload_{file.filename}")
+    filename = secure_filename(file.filename) or "upload.pdf"
+    fd, temp_path = tempfile.mkstemp(prefix="veridocs_upload_", suffix=f"_{filename}")
+    os.close(fd)
+
     try:
         file.save(temp_path)
-        catalog = load_ocr_catalog()
-        res = process_scanned_pdf(
-            pdf_path=temp_path,
-            excel_manager=excel_manager,
-            catalog=catalog,
-            log_callback=session_manager.log
-        )
-        if res["success"]:
-            session_manager.last_batch = res
-            session_manager.batches_history.append(res)
-            if res.get("alert"):
-                session_manager.add_alert(
-                    title=f"Aviso en OF {res['of']}",
-                    message=res["alert"],
-                    level="warning",
-                    dest_dir=res["destination_dir"]
-                )
+        # Procesamiento seguro a través de la sesión unificada (con lock de concurrencia)
+        res = session_manager.process_file(temp_path)
         return jsonify(res)
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -211,7 +253,6 @@ def run_web_server(open_browser=False):
     if port != configured_port:
         print(f"[Aviso] Puerto {configured_port} ocupado. Usando puerto libre {port}.")
 
-    # Iniciar precarga de Excel y arranque de escucha automática
     threading.Thread(target=lambda: excel_manager.get_orders(force_reload=True), daemon=True).start()
     if cfg.get("auto_listen_on_startup", True):
         session_manager.start_listening()

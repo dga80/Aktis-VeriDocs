@@ -23,7 +23,8 @@ DEFAULT_CONFIG = {
     "ocr_header_height_percent": 30,
     "ocr_footer_height_percent": 15,
     "ocr_lang": "es-ES",
-    "auto_listen_on_startup": True
+    "auto_listen_on_startup": True,
+    "duplex_mode": True
 }
 
 def load_config():
@@ -46,8 +47,11 @@ def load_config():
 
 def save_config(config_dict):
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        temp_file = CONFIG_FILE + ".tmp"
+        with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(config_dict, f, indent=4, ensure_ascii=False)
+        # Atomic replace on Windows
+        os.replace(temp_file, CONFIG_FILE)
         return True
     except Exception as e:
         print(f"Error saving config: {e}")

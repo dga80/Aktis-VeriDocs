@@ -12,5 +12,6 @@
     "ocr_header_height_percent": 30,
     "ocr_footer_height_percent": 15,
     "ocr_lang": "es-ES",
-    "auto_listen_on_startup": true
+    "auto_listen_on_startup": true,
+    "duplex_mode": true
 }

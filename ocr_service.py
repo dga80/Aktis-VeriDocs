@@ -1,7 +1,9 @@
 import os
 import re
 import asyncio
+import threading
 import unicodedata
+import difflib
 from typing import Dict, List, Optional, Tuple, Any, Union
 from PIL import Image, ImageOps
 
@@ -19,6 +21,17 @@ try:
 except ImportError:
     winocr = None
     WINOCR_AVAILABLE = False
+
+
+_thread_local = threading.local()
+
+def _get_ocr_loop():
+    """Obtiene o crea un bucle asyncio reutilizable por hilo para evitar recrearlo en cada llamada."""
+    loop = getattr(_thread_local, "loop", None)
+    if loop is None or loop.is_closed():
+        loop = asyncio.new_event_loop()
+        _thread_local.loop = loop
+    return loop
 
 
 def is_ocr_available() -> Tuple[bool, str]:
@@ -115,14 +128,15 @@ def render_page_region(
 
 
 def extract_text_from_image(img: Image.Image, lang: str = "es-ES") -> Dict[str, Any]:
-    """Ejecuta OCR sobre una imagen PIL y retorna texto completo y líneas."""
+    """Ejecuta OCR sobre una imagen PIL y retorna texto completo y líneas usando bucle optimizado."""
     avail, msg = is_ocr_available()
     if not avail:
         return {"success": False, "error": msg, "text": "", "lines": []}
 
     try:
         prepared = _prepare_image_for_ocr(img)
-        result = asyncio.run(winocr.recognize_pil(prepared, lang=lang))
+        loop = _get_ocr_loop()
+        result = loop.run_until_complete(winocr.recognize_pil(prepared, lang=lang))
         extracted_text = result.text.strip() if hasattr(result, "text") else ""
         lines = [line.text.strip() for line in getattr(result, "lines", []) if hasattr(line, "text")]
         return {
@@ -154,29 +168,36 @@ def is_page_blank(
     close_doc_at_end = False
     doc = None
     try:
-        if isinstance(pdf_input, str):
-            doc = pdfium.PdfDocument(pdf_input)
-            close_doc_at_end = True
+        if isinstance(pdf_input, Image.Image):
+            gray = pdf_input.convert("L")
         else:
-            doc = pdf_input
-
-        if page_index < 0 or page_index >= len(doc):
-            return False
-
-        page = doc[page_index]
-        # 1. Comprobar texto vectorial nativo
-        try:
-            tp = page.get_textpage()
-            txt = tp.get_text_range().strip()
-            if len(txt) > 25:
+            if not PDFIUM_AVAILABLE:
                 return False
-        except Exception:
-            pass
+            if isinstance(pdf_input, str):
+                if not os.path.exists(pdf_input):
+                    return False
+                doc = pdfium.PdfDocument(pdf_input)
+                close_doc_at_end = True
+            else:
+                doc = pdf_input
 
-        # 2. Renderizado ultrarrápido a escala 1.0 (72 DPI)
-        bitmap = page.render(scale=1.0)
-        pil_img = bitmap.to_pil()
-        gray = pil_img.convert("L")
+            if page_index < 0 or page_index >= len(doc):
+                return False
+
+            page = doc[page_index]
+            # 1. Comprobar texto vectorial nativo
+            try:
+                tp = page.get_textpage()
+                txt = tp.get_text_range().strip()
+                if len(txt) > 25:
+                    return False
+            except Exception:
+                pass
+
+            # 2. Renderizado ultrarrápido a escala 1.0 (72 DPI)
+            bitmap = page.render(scale=1.0)
+            pil_img = bitmap.to_pil()
+            gray = pil_img.convert("L")
 
         import numpy as np
         arr = np.array(gray)
@@ -245,6 +266,21 @@ def extract_footer_text(
     return extract_text_from_image(img, lang=lang)
 
 
+# Regex precompiladas para extracción de OFs
+_RE_PRIMARY_OF = re.compile(
+    r'\b([A-Za-z0-9_-]{2,8})\s*[/\\|I1l!]\s*MO\s*[/\\|I1l!]\s*([0-9OIl]{3,6})\b',
+    re.IGNORECASE
+)
+_RE_SECONDARY_OF = re.compile(
+    r'([A-Za-z0-9_-]{2,8})[/\\|I1l!]+MO[/\\|I1l!]+(\d{3,6})',
+    re.IGNORECASE
+)
+_RE_TERTIARY_OF = re.compile(
+    r'MO\s*[/\\|I1l!]\s*([0-9OIl]{3,6})',
+    re.IGNORECASE
+)
+
+
 def _find_ofs_in_text(raw_text: str) -> List[str]:
     """Busca patrones de OF (ej: AYC/MO/00524) dentro de un texto extraído."""
     if not raw_text:
@@ -252,15 +288,8 @@ def _find_ofs_in_text(raw_text: str) -> List[str]:
 
     clean_text = raw_text.replace('\r', ' ').replace('\n', ' ')
 
-    # Patrón principal: [PREFIJO]/MO/[NUMERO]
-    # Permite barras (/,\), pipes (|) o confusiones OCR verticales (I, 1, l, !)
-    primary_pat = re.compile(
-        r'\b([A-Za-z0-9_-]{2,8})\s*[/\\|I1l!]\s*MO\s*[/\\|I1l!]\s*([0-9OIl]{3,6})\b',
-        re.IGNORECASE
-    )
-
     detected = []
-    for match in primary_pat.finditer(clean_text):
+    for match in _RE_PRIMARY_OF.finditer(clean_text):
         prefix = match.group(1).upper()
         raw_num = match.group(2).upper()
         clean_num = raw_num.replace('O', '0').replace('I', '1').replace('L', '1')
@@ -270,16 +299,14 @@ def _find_ofs_in_text(raw_text: str) -> List[str]:
 
     # Patrón secundario más permisivo
     if not detected:
-        secondary_pat = re.compile(r'([A-Za-z0-9_-]{2,8})[/\\|I1l!]+MO[/\\|I1l!]+(\d{3,6})', re.IGNORECASE)
-        for m in secondary_pat.finditer(clean_text):
+        for m in _RE_SECONDARY_OF.finditer(clean_text):
             cand = f"{m.group(1).upper()}/MO/{m.group(2)}"
             if cand not in detected:
                 detected.append(cand)
 
     # Patrón terciario: búsqueda de MO/[NUMERO]
     if not detected:
-        tertiary_pat = re.compile(r'MO\s*[/\\|I1l!]\s*([0-9OIl]{3,6})', re.IGNORECASE)
-        for m in tertiary_pat.finditer(clean_text):
+        for m in _RE_TERTIARY_OF.finditer(clean_text):
             clean_num = m.group(1).upper().replace('O', '0').replace('I', '1').replace('L', '1')
             detected.append(f"MO/{clean_num}")
 
@@ -295,86 +322,91 @@ def extract_of_from_header(
     """
     Analiza la cabecera de la página indicada (normalmente la página 1) y busca la OF.
     Ejemplos esperados: AYC/MO/00560, CESA/MO/00154, LOESS/MO/00087, MES/MO/05310.
-    Si la página está apaisada (landscape) o rotada, prueba automáticamente
-    las orientaciones de 90°, 270° y 180° para asegurar la detección.
-    Retorna la lista de candidatas detectadas y la mejor coincidencia.
+    Renderiza la imagen una sola vez a escala 2.5 y prueba rotaciones sobre la misma imagen.
     """
-    # 1. Intento estándar a 0°
-    ocr_res = extract_header_text(
-        pdf_input,
-        page_index=page_index,
-        header_height_percent=header_height_percent,
-        lang=lang
-    )
+    if not PDFIUM_AVAILABLE or not WINOCR_AVAILABLE:
+        return {"success": False, "best_of": None, "detected_ofs": [], "raw_text": "", "lines": [], "error": "OCR no disponible"}
 
-    detected = []
-    raw_text = ""
-    lines = []
+    close_doc = False
+    doc = None
+    try:
+        if isinstance(pdf_input, str):
+            if not os.path.exists(pdf_input):
+                return {"success": False, "best_of": None, "detected_ofs": [], "raw_text": "", "lines": [], "error": "Archivo no encontrado"}
+            doc = pdfium.PdfDocument(pdf_input)
+            close_doc = True
+        else:
+            doc = pdf_input
 
-    if ocr_res.get("success"):
-        raw_text = ocr_res.get("text", "")
-        lines = ocr_res.get("lines", [])
-        detected = _find_ofs_in_text(raw_text)
+        if page_index >= len(doc):
+            return {"success": False, "best_of": None, "detected_ofs": [], "raw_text": "", "lines": [], "error": "Índice de página fuera de rango"}
 
-    # 2. Si no se encontró OF, probar en orientaciones rotadas (hojas apaisadas)
-    if not detected and PDFIUM_AVAILABLE and WINOCR_AVAILABLE:
-        close_doc = False
-        doc = None
-        try:
-            if isinstance(pdf_input, str):
-                if os.path.exists(pdf_input):
-                    doc = pdfium.PdfDocument(pdf_input)
-                    close_doc = True
-            else:
-                doc = pdf_input
+        # 1. Renderizado único de alta calidad (escala 2.5)
+        page = doc[page_index]
+        pil_img = page.render(scale=2.5).to_pil()
+        width, height = pil_img.size
 
-            if doc and page_index < len(doc):
-                page = doc[page_index]
-                pil_img = page.render(scale=2.5).to_pil()
-                
-                # Probar 90° horario (Image.Transpose.ROTATE_270)
-                rot90 = pil_img.transpose(Image.Transpose.ROTATE_270)
-                rw, rh = rot90.size
-                head90 = rot90.crop((0, 0, rw, int(rh * 0.40)))
-                res90 = extract_text_from_image(head90, lang=lang)
-                if res90.get("success"):
-                    det90 = _find_ofs_in_text(res90.get("text", ""))
-                    if det90:
-                        detected = det90
-                        raw_text = res90.get("text", "")
-                        lines = res90.get("lines", [])
+        # 2. Intento estándar a 0°
+        pct = max(5, min(80, header_height_percent))
+        crop_box = (0, 0, width, int(height * (pct / 100.0)))
+        head_img = pil_img.crop(crop_box)
+        ocr_res = extract_text_from_image(head_img, lang=lang)
 
-                # Si aún no, probar 270° horario (Image.Transpose.ROTATE_90)
-                if not detected:
-                    rot270 = pil_img.transpose(Image.Transpose.ROTATE_90)
-                    rw2, rh2 = rot270.size
-                    head270 = rot270.crop((0, 0, rw2, int(rh2 * 0.40)))
-                    res270 = extract_text_from_image(head270, lang=lang)
-                    if res270.get("success"):
-                        det270 = _find_ofs_in_text(res270.get("text", ""))
-                        if det270:
-                            detected = det270
-                            raw_text = res270.get("text", "")
-                            lines = res270.get("lines", [])
-        except Exception as e_rot_of:
-            print(f"[ocr_service] Error buscando OF en orientaciones rotadas: {e_rot_of}")
-        finally:
-            if close_doc and doc:
-                try:
-                    doc.close()
-                except Exception:
-                    pass
+        detected = []
+        raw_text = ""
+        lines = []
 
-    best_of = detected[0] if detected else None
+        if ocr_res.get("success"):
+            raw_text = ocr_res.get("text", "")
+            lines = ocr_res.get("lines", [])
+            detected = _find_ofs_in_text(raw_text)
 
-    return {
-        "success": bool(best_of),
-        "best_of": best_of,
-        "detected_ofs": detected,
-        "raw_text": raw_text,
-        "lines": lines,
-        "error": None if best_of else "No se detectó ningún patrón de OF en la cabecera"
-    }
+        # 3. Si no se encontró OF, probar en orientaciones rotadas usando la misma imagen en memoria
+        if not detected:
+            # Probar 90° horario (Image.Transpose.ROTATE_270)
+            rot90 = pil_img.transpose(Image.Transpose.ROTATE_270)
+            rw, rh = rot90.size
+            head90 = rot90.crop((0, 0, rw, int(rh * 0.40)))
+            res90 = extract_text_from_image(head90, lang=lang)
+            if res90.get("success"):
+                det90 = _find_ofs_in_text(res90.get("text", ""))
+                if det90:
+                    detected = det90
+                    raw_text = res90.get("text", "")
+                    lines = res90.get("lines", [])
+
+            # Si aún no, probar 270° horario (Image.Transpose.ROTATE_90)
+            if not detected:
+                rot270 = pil_img.transpose(Image.Transpose.ROTATE_90)
+                rw2, rh2 = rot270.size
+                head270 = rot270.crop((0, 0, rw2, int(rh2 * 0.40)))
+                res270 = extract_text_from_image(head270, lang=lang)
+                if res270.get("success"):
+                    det270 = _find_ofs_in_text(res270.get("text", ""))
+                    if det270:
+                        detected = det270
+                        raw_text = res270.get("text", "")
+                        lines = res270.get("lines", [])
+
+        best_of = detected[0] if detected else None
+
+        return {
+            "success": bool(best_of),
+            "best_of": best_of,
+            "detected_ofs": detected,
+            "raw_text": raw_text,
+            "lines": lines,
+            "error": None if best_of else "No se detectó ningún patrón de OF en la cabecera"
+        }
+    except Exception as e:
+        print(f"[ocr_service] Error extrayendo OF de cabecera: {e}")
+        return {"success": False, "best_of": None, "detected_ofs": [], "raw_text": "", "lines": [], "error": str(e)}
+    finally:
+        if close_doc and doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
 
 
 DOCUMENT_KEYWORDS: Dict[str, List[str]] = {
@@ -442,17 +474,36 @@ def suppress_table_lines(pil_img: Image.Image) -> Image.Image:
         return pil_img
 
 
+# Caché de expresiones regulares compiladas para códigos de documentos
+_CODE_REGEX_CACHE: Dict[str, Tuple[re.Pattern, re.Pattern, Optional[re.Pattern]]] = {}
+
+def _get_code_regexes(raw_code: str):
+    if raw_code not in _CODE_REGEX_CACHE:
+        escaped = re.escape(raw_code)
+        exact_pat = re.compile(rf'(?<![A-Z0-9]){escaped}(?![A-Z0-9])')
+        clean_delims = escaped.replace(r'\-', '-').replace(r'\_', '_')
+        spaced = re.sub(r'[-_]', r'[-_\\s]+', clean_delims)
+        spaced_pat = re.compile(rf'(?<![A-Z0-9]){spaced}(?![A-Z0-9])')
+        
+        m = re.match(r'DC-(\d{4})', raw_code)
+        dc_pat = None
+        if m:
+            num = m.group(1).replace('0', '[0O]')
+            dc_pat = re.compile(rf'(?:DC|C|DOC|DOCUMENTO)[\s\-_.:]*{num}')
+        _CODE_REGEX_CACHE[raw_code] = (exact_pat, spaced_pat, dc_pat)
+    return _CODE_REGEX_CACHE[raw_code]
+
+
 def score_document_candidate(clean_text: str, compact_text: str, raw_code: str, doc_name: str) -> int:
     """Evalúa la coincidencia de un candidato con el texto OCR asignando puntuación de 0 a 100."""
-    escaped = re.escape(raw_code)
+    exact_pat, spaced_pat, dc_pat = _get_code_regexes(raw_code)
 
     # 1. Búsqueda exacta respetando límites alfanuméricos
-    if re.search(rf'(?<![A-Z0-9]){escaped}(?![A-Z0-9])', clean_text):
+    if exact_pat.search(clean_text):
         return 100
 
     # 2. Tolerancia a espacios o guiones alternativos (ej: 'DC 0021' o 'DC_0021')
-    spaced = re.sub(r'[-_]', r'[-_\\s]+', escaped)
-    if re.search(rf'(?<![A-Z0-9]){spaced}(?![A-Z0-9])', clean_text):
+    if spaced_pat.search(clean_text):
         return 90
 
     # 3. Coincidencia compacta sin espacios ni guiones (ej: 'DC0021')
@@ -461,20 +512,16 @@ def score_document_candidate(clean_text: str, compact_text: str, raw_code: str, 
         return 85
 
     # 4. Código numérico con contexto de documento (ej: Documento: 0021, DC-0O21)
-    m = re.match(r'DC-(\d{4})', raw_code)
-    if m:
-        num = m.group(1)
-        num_pat = num.replace('0', '[0O]')
-        if re.search(rf'(?:DC|C|DOC|DOCUMENTO)[\s\-_.:]*{num_pat}', clean_text):
-            return 80
+    if dc_pat and dc_pat.search(clean_text):
+        return 80
 
     # 5. Palabras clave y título del documento
-    import difflib
     kws = DOCUMENT_KEYWORDS.get(raw_code, [])
     if doc_name and doc_name.upper() not in [k.upper() for k in kws]:
         kws = list(kws) + [doc_name.upper()]
 
     score = 0
+    clean_words = re.findall(r'[A-Z0-9ÁÉÍÓÚ]{3,}', clean_text)
     for kw in kws:
         kw_clean = kw.upper()
         if kw_clean in clean_text:
@@ -482,12 +529,12 @@ def score_document_candidate(clean_text: str, compact_text: str, raw_code: str, 
         elif re.sub(r'[\s\-_()]', '', kw_clean) in compact_text:
             score = max(score, 70)
         else:
-            kw_words = [w for w in re.findall(r'[A-Z0-9ÁÉÍÓÚ]{4,}', kw_clean)]
+            kw_words = re.findall(r'[A-Z0-9ÁÉÍÓÚ]{4,}', kw_clean)
             if len(kw_words) >= 2:
                 matched_w = 0
                 for kw_w in kw_words:
                     if any(kw_w in tw or tw in kw_w or difflib.SequenceMatcher(None, kw_w, tw).ratio() >= 0.75 
-                           for tw in re.findall(r'[A-Z0-9ÁÉÍÓÚ]{3,}', clean_text)):
+                           for tw in clean_words):
                         matched_w += 1
                 if matched_w == len(kw_words):
                     score = max(score, 65)
@@ -522,6 +569,8 @@ def match_footer_code(ocr_text: str, candidates: List[Dict[str, Any]]) -> Tuple[
             best_score = score
             best_item = item
             best_code = code
+            if best_score == 100:
+                break # Coincidencia perfecta encontrada
 
     if best_score >= 60:
         return best_item, best_code
@@ -537,18 +586,8 @@ def extract_footer_and_detect_code(
 ) -> Dict[str, Any]:
     """
     Analiza una página para identificar el código de documento oficial en el pie.
-    Incluye detección automática para hojas apaisadas (landscape) y volteadas:
-    1. Intento estándar: Franja inferior (0°).
-    2. Si no coincide, analiza la orientación apaisada 90° horario (pie y cabecera).
-    3. Si no coincide, analiza la orientación apaisada 270° horario (pie y cabecera).
-    4. Si aún no coincide, analiza la franja superior invertida (180°).
-    
-    Retorna un diccionario con:
-    - matched_doc: Dict o None
-    - matched_code: str o None
-    - rotation_needed: int (0, 90, 180, 270)
-    - text: str
-    - strategy: str
+    Optimizado: Comprueba página en blanco PRIMERO antes de realizar múltiples pasadas OCR.
+    Incluye detección automática para hojas apaisadas (landscape) y volteadas.
     """
     if not PDFIUM_AVAILABLE or not WINOCR_AVAILABLE:
         return {"matched_doc": None, "matched_code": None, "rotation_needed": 0, "text": "", "strategy": "ocr_unavailable"}
@@ -569,6 +608,17 @@ def extract_footer_and_detect_code(
     try:
         if len(doc) <= page_index:
             return {"matched_doc": None, "matched_code": None, "rotation_needed": 0, "text": "", "strategy": "index_out_of_range"}
+
+        # --- OPTIMIZACIÓN CLAVE: Comprobar si la página está en blanco PRIMERO ---
+        # Si es un reverso blanco, ahorramos todas las llamadas de render y OCR posteriores
+        if is_page_blank(doc, page_index=page_index, dark_pixel_threshold=190, max_dark_ratio=0.003):
+            return {
+                "matched_doc": None,
+                "matched_code": "BLANK",
+                "rotation_needed": 0,
+                "text": "",
+                "strategy": "blank_page_fast"
+            }
 
         # 1. Renderizado a escala óptima (2.5) para nitidez OCR
         page = doc[page_index]
@@ -609,16 +659,6 @@ def extract_footer_and_detect_code(
                 "rotation_needed": 0,
                 "text": res_bottom.get("text", ""),
                 "strategy": "bottom_standard"
-            }
-
-        # Comprobar si la página está en blanco antes de gastar recursos en rotaciones
-        if is_page_blank(doc, page_index=page_index):
-            return {
-                "matched_doc": None,
-                "matched_code": "BLANK",
-                "rotation_needed": 0,
-                "text": "",
-                "strategy": "blank_page"
             }
 
         # --- ESTRATEGIA 2: Hoja apaisada rotada 90° horario (Image.Transpose.ROTATE_270) ---
@@ -724,7 +764,7 @@ def extract_footer_and_detect_code(
                 "strategy": "top_inverted_180"
             }
 
-        # Si ninguna orientación detectó código, comprobar si la página está en blanco
+        # Fallback de página en blanco con umbral más tolerante si fallaron todas las rotaciones
         if is_page_blank(doc, page_index=page_index, dark_pixel_threshold=190, max_dark_ratio=0.005):
             return {
                 "matched_doc": None,
@@ -757,153 +797,3 @@ def extract_footer_and_detect_code(
                 doc.close()
             except Exception:
                 pass
-
-
-def identify_document_from_pdf(
-    pdf_input: Union[str, Any],
-    candidates: List[Dict[str, Any]],
-    page_index: int = 0,
-    footer_height_percent: int = 15,
-    lang: str = "es-ES"
-) -> Dict[str, Any]:
-    """Analiza una página y determina qué documento es según el pie de página."""
-    ocr_result = extract_footer_text(
-        pdf_input,
-        page_index=page_index,
-        footer_height_percent=footer_height_percent,
-        lang=lang
-    )
-
-    if not ocr_result["success"]:
-        return {
-            "matched": False,
-            "document": None,
-            "code": None,
-            "raw_text": "",
-            "error": ocr_result["error"]
-        }
-
-    raw_text = ocr_result["text"]
-    matched_doc, detected_code = match_footer_code(raw_text, candidates)
-
-    return {
-        "matched": matched_doc is not None,
-        "document": matched_doc,
-        "code": detected_code,
-        "raw_text": raw_text,
-        "lines": ocr_result.get("lines", []),
-        "error": None
-    }
-
-
-def load_ocr_catalog(excel_path: Optional[str] = None) -> List[Dict[str, Any]]:
-    """
-    Carga el catálogo oficial de tipos de documentos desde codigosOCR.xlsx.
-    Retorna una lista de dicts:
-    [{'id': idx, 'codigo': 'DC-0020', 'documento': 'Control Estado (incidencias-Materiales)', 'is_incidencia': True}, ...]
-    """
-    if not excel_path:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        excel_path = os.path.join(base_dir, "codigosOCR.xlsx")
-
-    if not os.path.exists(excel_path):
-        print(f"[ocr_service] No se encontró el catálogo de códigos en: {excel_path}")
-        return []
-
-    try:
-        import openpyxl
-        wb = openpyxl.load_workbook(excel_path, data_only=True, read_only=True)
-        ws = wb.active
-        catalog = []
-        for idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=1):
-            if not row or len(row) < 2:
-                continue
-            code = str(row[0]).strip() if row[0] is not None else ""
-            doc_name = str(row[1]).strip() if row[1] is not None else ""
-            if code and doc_name:
-                is_inc = (code.upper() in ("DC-0020", "DC-0022") or "INCIDENCIA" in doc_name.upper())
-                catalog.append({
-                    "id": idx,
-                    "codigo": code,
-                    "documento": doc_name,
-                    "footer_code": code,
-                    "name": doc_name,
-                    "is_incidencia": is_inc
-                })
-        wb.close()
-        return catalog
-    except Exception as e:
-        print(f"[ocr_service] Error leyendo {excel_path}: {e}")
-        return []
-
-
-def analyze_batch_pdf(
-    pdf_path: str,
-    catalog: Optional[List[Dict[str, Any]]] = None,
-    header_height_percent: int = 30,
-    footer_height_percent: int = 15,
-    lang: str = "es-ES"
-) -> Dict[str, Any]:
-    """
-    Realiza el análisis completo de un PDF multipágina escaneado:
-    1. Abre el PDF con pdfium.
-    2. En la página 0 (primera hoja), hace OCR de cabecera y extrae la OF.
-    3. En cada una de las páginas (0 a N-1), hace OCR de pie de página y clasifica según codigosOCR.xlsx.
-    4. Retorna el resultado estructurado para proceder al corte y agrupación.
-    """
-    if not PDFIUM_AVAILABLE or not os.path.exists(pdf_path):
-        return {"success": False, "error": f"Archivo PDF no accesible: {pdf_path}"}
-
-    if not catalog:
-        catalog = load_ocr_catalog()
-
-    try:
-        doc = pdfium.PdfDocument(pdf_path)
-        total_pages = len(doc)
-        if total_pages == 0:
-            doc.close()
-            return {"success": False, "error": "El documento PDF está vacío (0 páginas)."}
-
-        # 1. OCR Cabecera página 0 -> Detectar OF
-        of_res = extract_of_from_header(
-            doc,
-            page_index=0,
-            header_height_percent=header_height_percent,
-            lang=lang
-        )
-        detected_of = of_res.get("best_of")
-
-        # 2. OCR Pie de página para todas las hojas
-        pages_analysis = []
-        for p_idx in range(total_pages):
-            doc_id_res = identify_document_from_pdf(
-                doc,
-                candidates=catalog,
-                page_index=p_idx,
-                footer_height_percent=footer_height_percent,
-                lang=lang
-            )
-            pages_analysis.append({
-                "page_index": p_idx,
-                "page_number": p_idx + 1,
-                "matched": doc_id_res["matched"],
-                "document": doc_id_res["document"],
-                "code": doc_id_res["code"],
-                "raw_footer": doc_id_res.get("raw_text", ""),
-                "is_incidencia": bool(doc_id_res["document"] and doc_id_res["document"].get("is_incidencia"))
-            })
-
-        doc.close()
-
-        return {
-            "success": True,
-            "total_pages": total_pages,
-            "of_detected": detected_of,
-            "of_analysis": of_res,
-            "pages": pages_analysis,
-            "error": None
-        }
-    except Exception as e:
-        print(f"[ocr_service] Error analizando PDF por lotes: {e}")
-        return {"success": False, "error": str(e)}
-

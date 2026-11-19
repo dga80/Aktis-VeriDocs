@@ -18,6 +18,7 @@ from veridocs_core import (
     load_ocr_catalog,
     process_scanned_pdf,
     sanitize_filename,
+    to_windows_long_path,
     DOCUMENTS_DEF,
     get_effective_documents_def
 )
@@ -28,7 +29,7 @@ ctk.set_default_color_theme("blue")
 
 
 def show_system_notification(title: str, message: str, is_error: bool = False):
-    """Emite sonido de confirmación y lanza una notificación nativa Toast de Windows si es posible."""
+    """Emite sonido de confirmación y lanza una notificación nativa Toast de Windows."""
     def _run():
         try:
             import winsound
@@ -37,6 +38,23 @@ def show_system_notification(title: str, message: str, is_error: bool = False):
         except Exception:
             pass
 
+        # Intento con winrt nativo
+        try:
+            import winrt.windows.ui.notifications as notifications
+            import winrt.windows.data.xml.dom as dom
+            template_type = notifications.ToastTemplateType.TOAST_TEXT02
+            xml_doc = notifications.ToastNotificationManager.get_template_content(template_type)
+            text_nodes = xml_doc.get_elements_by_tag_name("text")
+            text_nodes.item(0).append_child(xml_doc.create_text_node(title))
+            text_nodes.item(1).append_child(xml_doc.create_text_node(message))
+            toast = notifications.ToastNotification(xml_doc)
+            notifier = notifications.ToastNotificationManager.create_toast_notifier("VeriDocs")
+            notifier.show(toast)
+            return
+        except Exception:
+            pass
+
+        # Fallback PowerShell con escape seguro
         try:
             t = title.replace("'", "''").replace('"', '""')
             m = message.replace("'", "''").replace('"', '""')
@@ -80,8 +98,8 @@ class VeriDocsDesktopApp(ctk.CTk):
         super().__init__()
 
         self.title("VeriDocs - Gestión y Renombrado Automático de Escaneos MES")
-        self.geometry("1240x840")
-        self.minsize(1040, 720)
+        self.geometry("1260x860")
+        self.minsize(1060, 740)
 
         self.excel_manager = ExcelManager()
         self.session_manager = ScanningSession(self.excel_manager)
@@ -89,12 +107,15 @@ class VeriDocsDesktopApp(ctk.CTk):
         self.filtered_catalog = list(self.catalog)
         self.selected_order = None
         self.current_alert_data = None
+        self.currently_viewed_batch = None
+        self._search_timer = None
 
-        # Variables de control para evitar refrescos innecesarios de UI
+        # Variables de control monotónicas para evitar parpadeos y congelaciones
         self.last_rendered_batch_key = None
         self.last_rendered_live_count = -1
-        self.seen_log_count = 0
-        self.seen_batches_count = -1
+        self.last_seen_event_id = 0
+        self.last_seen_batch_id = -1
+        self._active_alert_index = 0
 
         # Iniciar escucha automática si está configurada
         cfg = load_config()
@@ -104,11 +125,22 @@ class VeriDocsDesktopApp(ctk.CTk):
         self.setup_ui()
         self.check_system_connectivity()
 
+        # Interceptar cierre de ventana
+        self.protocol("WM_DELETE_WINDOW", self.on_close_window)
+
         # Cargar pedidos de Excel en segundo plano
         threading.Thread(target=self._initial_load_excel, daemon=True).start()
 
         # Sondeo periódico de la sesión
         self.poll_session_status()
+
+    def on_close_window(self):
+        status = self.session_manager.get_status()
+        if status.get("current_progress", {}).get("is_processing"):
+            if not messagebox.askyesno("Lote en Proceso", "Hay un lote de escaneo procesándose actualmente.\n¿Seguro que deseas cerrar la aplicación?"):
+                return
+        self.session_manager.stop_listening()
+        self.destroy()
 
     def _initial_load_excel(self):
         self.excel_manager.get_orders(force_reload=True)
@@ -155,6 +187,28 @@ class VeriDocsDesktopApp(ctk.CTk):
         btn_settings.pack(side="right", padx=(8, 14))
 
         # Píldoras de estado en la cabecera (Badge chips)
+        self.pill_queue = ctk.CTkLabel(
+            header,
+            text="● Bandeja: 0 pend.",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="gray25",
+            corner_radius=12,
+            padx=10,
+            pady=4
+        )
+        self.pill_queue.pack(side="right", padx=4)
+
+        self.pill_ot = ctk.CTkLabel(
+            header,
+            text="● OT: Comprobando...",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            fg_color="gray25",
+            corner_radius=12,
+            padx=10,
+            pady=4
+        )
+        self.pill_ot.pack(side="right", padx=4)
+
         self.pill_ocr = ctk.CTkLabel(
             header,
             text="● OCR: Comprobando...",
@@ -164,18 +218,18 @@ class VeriDocsDesktopApp(ctk.CTk):
             padx=10,
             pady=4
         )
-        self.pill_ocr.pack(side="right", padx=6)
+        self.pill_ocr.pack(side="right", padx=4)
 
         self.pill_folder = ctk.CTkLabel(
             header,
-            text="● Bandeja: Comprobando...",
+            text="● Escaneos: Comprobando...",
             font=ctk.CTkFont(size=11, weight="bold"),
             fg_color="gray25",
             corner_radius=12,
             padx=10,
             pady=4
         )
-        self.pill_folder.pack(side="right", padx=6)
+        self.pill_folder.pack(side="right", padx=4)
 
         self.pill_excel = ctk.CTkLabel(
             header,
@@ -186,31 +240,40 @@ class VeriDocsDesktopApp(ctk.CTk):
             padx=10,
             pady=4
         )
-        self.pill_excel.pack(side="right", padx=6)
+        self.pill_excel.pack(side="right", padx=4)
 
-        # 2. Banner de Alertas (Visible solo cuando hay alerta activa)
+        # 2. Banner de Alertas Múltiples (Visible solo cuando hay alerta activa)
         self.alert_frame = ctk.CTkFrame(self, fg_color=("#991b1b", "#7f1d1d"), corner_radius=8)
-        # Oculto por defecto
 
         self.lbl_alert_icon = ctk.CTkLabel(
             self.alert_frame, text="⚠️", font=ctk.CTkFont(size=22)
         )
         self.lbl_alert_icon.pack(side="left", padx=(14, 8), pady=10)
 
+        self.lbl_alert_counter = ctk.CTkLabel(
+            self.alert_frame,
+            text="[1/1]",
+            font=ctk.CTkFont(family="Consolas", size=11, weight="bold"),
+            fg_color="gray30",
+            corner_radius=4,
+            padx=5
+        )
+        self.lbl_alert_counter.pack(side="left", padx=(0, 6))
+
         self.lbl_alert_msg = ctk.CTkLabel(
             self.alert_frame,
             text="",
-            font=ctk.CTkFont(size=13, weight="bold"),
+            font=ctk.CTkFont(size=12, weight="bold"),
             text_color="white",
             justify="left",
-            wraplength=720
+            wraplength=640
         )
         self.lbl_alert_msg.pack(side="left", padx=8, pady=10, fill="x", expand=True)
 
         self.btn_alert_folder = ctk.CTkButton(
             self.alert_frame,
             text="📂 Abrir Carpeta",
-            width=125,
+            width=120,
             height=30,
             fg_color="#f59e0b",
             hover_color="#d97706",
@@ -218,12 +281,24 @@ class VeriDocsDesktopApp(ctk.CTk):
             font=ctk.CTkFont(weight="bold"),
             command=self.open_alert_folder
         )
-        self.btn_alert_folder.pack(side="right", padx=(6, 8), pady=10)
+        self.btn_alert_folder.pack(side="right", padx=4, pady=10)
+
+        self.btn_alert_next = ctk.CTkButton(
+            self.alert_frame,
+            text="Siguiente ▶",
+            width=90,
+            height=30,
+            fg_color="gray35",
+            hover_color="gray45",
+            font=ctk.CTkFont(weight="bold"),
+            command=self.cycle_next_alert
+        )
+        self.btn_alert_next.pack(side="right", padx=4, pady=10)
 
         self.btn_alert_dismiss = ctk.CTkButton(
             self.alert_frame,
             text="✕ Descartar",
-            width=90,
+            width=85,
             height=30,
             fg_color="gray30",
             hover_color="gray40",
@@ -240,12 +315,12 @@ class VeriDocsDesktopApp(ctk.CTk):
         self.main_content.grid_columnconfigure(1, weight=6) # Columna derecha
         self.main_content.grid_rowconfigure(0, weight=1)
 
-        # Columna Izquierda (Pestañas ergonómicas)
+        # Columna Izquierda
         left_col = ctk.CTkFrame(self.main_content)
         left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         self.setup_left_column(left_col)
 
-        # Columna Derecha (Monitor en tiempo real, lote y consola)
+        # Columna Derecha
         right_col = ctk.CTkFrame(self.main_content)
         right_col.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
         self.setup_right_column(right_col)
@@ -254,7 +329,6 @@ class VeriDocsDesktopApp(ctk.CTk):
         parent.grid_columnconfigure(0, weight=1)
         parent.grid_rowconfigure(0, weight=1)
 
-        # Pestañas ergonómicas
         self.left_tabs = ctk.CTkTabview(parent)
         self.left_tabs.pack(fill="both", expand=True, padx=8, pady=8)
 
@@ -439,6 +513,18 @@ class VeriDocsDesktopApp(ctk.CTk):
             )
             of_lbl.pack(side="left", padx=6)
 
+            if b.get("ot_replica_path"):
+                ot_lbl = ctk.CTkLabel(
+                    top_row,
+                    text="OT ✓",
+                    font=ctk.CTkFont(size=10, weight="bold"),
+                    fg_color="#064e3b",
+                    text_color="#34d399",
+                    corner_radius=4,
+                    padx=4
+                )
+                ot_lbl.pack(side="left", padx=2)
+
             info_row = ctk.CTkFrame(card, fg_color="transparent")
             info_row.pack(fill="x", padx=8, pady=(0, 4))
 
@@ -449,7 +535,7 @@ class VeriDocsDesktopApp(ctk.CTk):
             desc = o_info.get("descripcion", "")
 
             odoo_tag = f"Odoo: {odoo} | " if odoo else ""
-            desc_tag = f"\n{desc[:40]}" if desc else ""
+            desc_tag = f"\n{desc[:38]}" if desc else ""
             stats_lbl = ctk.CTkLabel(
                 info_row,
                 text=f"{odoo_tag}{files_count} archivos ({total_pages} págs){desc_tag}",
@@ -463,6 +549,7 @@ class VeriDocsDesktopApp(ctk.CTk):
             btns_row = ctk.CTkFrame(card, fg_color="transparent")
             btns_row.pack(fill="x", padx=8, pady=(0, 6))
 
+            target_dir = b.get("destination_dir") or b.get("dest_dir", "")
             btn_open = ctk.CTkButton(
                 btns_row,
                 text="📂 Carpeta",
@@ -471,7 +558,7 @@ class VeriDocsDesktopApp(ctk.CTk):
                 font=ctk.CTkFont(size=10, weight="bold"),
                 fg_color="#059669",
                 hover_color="#047857",
-                command=lambda d=b.get("dest_dir", ""): os.startfile(d) if os.path.exists(d) else messagebox.showinfo("Carpeta", f"No disponible: {d}")
+                command=lambda d=target_dir: os.startfile(d) if os.path.exists(d) else messagebox.showinfo("Carpeta", f"No disponible: {d}")
             )
             btn_open.pack(side="right", padx=(4, 0))
 
@@ -488,10 +575,16 @@ class VeriDocsDesktopApp(ctk.CTk):
             btn_view.pack(side="right")
 
     def load_historical_batch_to_view(self, batch: dict):
+        self.currently_viewed_batch = batch
         self.render_batch_summary(batch)
         self.render_created_files_list(batch.get("created_files", []))
         self.btn_open_batch_folder.configure(state="normal", fg_color="#059669")
         self.btn_copy_batch_path.configure(state="normal")
+        if batch.get("ot_replica_path"):
+            self.btn_open_ot_folder.configure(state="normal", fg_color="#4338ca")
+        else:
+            self.btn_open_ot_folder.configure(state="disabled", fg_color="gray30")
+
         self.last_rendered_batch_key = f"{batch.get('of')}_{len(batch.get('created_files', []))}"
         if batch.get("alert"):
             self.lbl_alert_msg.configure(text=f"Aviso en lote cargado: {batch['alert']}")
@@ -654,11 +747,12 @@ class VeriDocsDesktopApp(ctk.CTk):
             )
             name_lbl.pack(side="left", fill="x", expand=True, padx=4)
 
-    def reload_catalog(self):
+    def reload_catalog(self, show_msg: bool = True):
         self.catalog = load_ocr_catalog()
         self.filter_catalog_list()
         self.lbl_catalog_title.configure(text=f"Catálogo Oficial ({len(self.catalog)} tipos)")
-        messagebox.showinfo("Catálogo", f"Se han cargado {len(self.catalog)} tipos de documentos desde codigosOCR.xlsx.")
+        if show_msg:
+            messagebox.showinfo("Catálogo", f"Se han cargado {len(self.catalog)} tipos de documentos desde codigosOCR.xlsx.")
 
     def setup_right_column(self, parent):
         parent.grid_columnconfigure(0, weight=1)
@@ -673,11 +767,10 @@ class VeriDocsDesktopApp(ctk.CTk):
             font=ctk.CTkFont(size=15, weight="bold")
         ).pack(side="left")
 
-        # Botón Limpiar Vista Visualmente
         btn_clear_view = ctk.CTkButton(
             header_r,
             text="🧹 Limpiar Vista",
-            width=110,
+            width=105,
             height=28,
             fg_color="gray30",
             hover_color="gray40",
@@ -686,11 +779,10 @@ class VeriDocsDesktopApp(ctk.CTk):
         )
         btn_clear_view.pack(side="right", padx=(6, 0))
 
-        # Botón Acceso Rápido a Historial
         btn_go_hist = ctk.CTkButton(
             header_r,
             text="📜 Ver Historial",
-            width=110,
+            width=105,
             height=28,
             fg_color="#3b82f6",
             hover_color="#2563eb",
@@ -722,27 +814,42 @@ class VeriDocsDesktopApp(ctk.CTk):
         self.lbl_batch_title.pack(side="left")
 
         # Botones de acción rápida del lote
+        self.btn_open_ot_folder = ctk.CTkButton(
+            batch_head,
+            text="📁 Abrir en OT",
+            height=28,
+            width=100,
+            fg_color="gray30",
+            hover_color="#3730a3",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            state="disabled",
+            command=self.open_current_batch_ot_folder
+        )
+        self.btn_open_ot_folder.pack(side="right", padx=(4, 0))
+
         self.btn_copy_batch_path = ctk.CTkButton(
             batch_head,
             text="📋 Copiar Ruta",
             height=28,
-            width=100,
+            width=95,
             fg_color="gray30",
             hover_color="gray40",
             font=ctk.CTkFont(size=11, weight="bold"),
+            state="disabled",
             command=self.copy_current_batch_folder
         )
-        self.btn_copy_batch_path.pack(side="right", padx=(6, 0))
+        self.btn_copy_batch_path.pack(side="right", padx=(4, 0))
 
         self.btn_open_batch_folder = ctk.CTkButton(
             batch_head,
             text="📂 Abrir Carpeta OF",
             height=28,
-            width=135,
-            fg_color="#059669",
+            width=130,
+            fg_color="gray30",
             hover_color="#047857",
             text_color="#ffffff",
             font=ctk.CTkFont(size=11, weight="bold"),
+            state="disabled",
             command=self.open_current_batch_folder
         )
         self.btn_open_batch_folder.pack(side="right")
@@ -755,7 +862,16 @@ class VeriDocsDesktopApp(ctk.CTk):
             justify="left",
             wraplength=600
         )
-        self.lbl_batch_sub.pack(anchor="w", padx=12, pady=(0, 10))
+        self.lbl_batch_sub.pack(anchor="w", padx=12, pady=(0, 4))
+
+        self.lbl_ot_status = ctk.CTkLabel(
+            self.last_batch_card,
+            text="",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#34d399",
+            justify="left"
+        )
+        self.lbl_ot_status.pack(anchor="w", padx=12, pady=(0, 8))
 
         # Barra y panel de Progreso en Vivo
         self.progress_frame = ctk.CTkFrame(parent, fg_color=("#dbeafe", "#0f2744"), corner_radius=6)
@@ -795,7 +911,7 @@ class VeriDocsDesktopApp(ctk.CTk):
         self.files_scroll = ctk.CTkScrollableFrame(parent, height=220)
         self.files_scroll.pack(fill="both", expand=True, padx=12, pady=(0, 6))
 
-        # Consola de Eventos (CTkTextbox para máximo rendimiento y cero parpadeo)
+        # Consola de Eventos
         log_header_box = ctk.CTkFrame(parent, fg_color="transparent")
         log_header_box.pack(fill="x", padx=14, pady=(4, 2))
 
@@ -846,8 +962,11 @@ class VeriDocsDesktopApp(ctk.CTk):
         """Limpia todo lo que se ha mostrado visualmente en pantalla (resetea vista)."""
         self.lbl_batch_title.configure(text="Último Lote: Vista restablecida")
         self.lbl_batch_sub.configure(text="Pantalla limpiada. La escucha sigue activa y el próximo escaneo se mostrará aquí.")
+        self.lbl_ot_status.configure(text="")
         self.btn_open_batch_folder.configure(state="disabled", fg_color="gray30")
         self.btn_copy_batch_path.configure(state="disabled")
+        self.btn_open_ot_folder.configure(state="disabled", fg_color="gray30")
+        self.currently_viewed_batch = None
 
         for w in self.files_scroll.winfo_children():
             w.destroy()
@@ -863,7 +982,6 @@ class VeriDocsDesktopApp(ctk.CTk):
             self.progress_frame.pack_forget()
 
         self.log_textbox.delete("1.0", "end")
-        self.seen_log_count = 0
 
         if self.alert_frame.winfo_ismapped():
             self.alert_frame.pack_forget()
@@ -912,54 +1030,9 @@ class VeriDocsDesktopApp(ctk.CTk):
         def _worker():
             fname = os.path.basename(file_path)
             self.session_manager.log(f"Iniciando procesamiento manual de: '{fname}'...")
-            self.session_manager.update_progress(
-                is_processing=True,
-                filename=fname,
-                phase="Iniciando análisis manual...",
-                current_page=0,
-                total_pages=0,
-                created_files=[]
-            )
+            res = self.session_manager.process_file(file_path)
 
-            def _on_prog(pdata):
-                self.session_manager.update_progress(
-                    is_processing=True,
-                    filename=fname,
-                    of=pdata.get("of", ""),
-                    phase=pdata.get("phase", ""),
-                    current_page=pdata.get("current_page", 0),
-                    total_pages=pdata.get("total_pages", 0),
-                    created_files=pdata.get("created_files", [])
-                )
-
-            res = process_scanned_pdf(
-                pdf_path=file_path,
-                excel_manager=self.excel_manager,
-                catalog=self.catalog,
-                log_callback=self.session_manager.log,
-                progress_callback=_on_prog
-            )
-            self.session_manager.update_progress(is_processing=False)
-
-            if res["success"]:
-                self.session_manager.last_batch = res
-                self.session_manager.batches_history.append({
-                    "time": datetime.now().strftime("%H:%M:%S"),
-                    "of": res["of"],
-                    "order_info": res["order_info"],
-                    "dest_dir": res["destination_dir"],
-                    "total_pages": res["total_pages"],
-                    "files_count": len(res["created_files"]),
-                    "created_files": res["created_files"],
-                    "alert": res["alert"]
-                })
-                if res.get("alert"):
-                    self.session_manager.add_alert(
-                        title=f"Aviso en OF {res['of']}",
-                        message=res["alert"],
-                        level="warning",
-                        dest_dir=res["destination_dir"]
-                    )
+            if res.get("success"):
                 show_system_notification(
                     f"OF {res['of']} procesada con éxito",
                     f"Se han generado {len(res['created_files'])} archivos PDF."
@@ -981,34 +1054,47 @@ class VeriDocsDesktopApp(ctk.CTk):
         threading.Thread(target=_worker, daemon=True).start()
 
     def poll_session_status(self):
-        """Sondeo periódico sin parpadeos ni fugas de rendimiento."""
+        """Sondeo periódico sin parpadeos ni congelaciones."""
         try:
             status = self.session_manager.get_status()
 
-            # 1. Estado del botón según el estado real
+            # 1. Estado del botón
             if status["active"]:
-                self.lbl_session_badge.configure(text="ESCUCHANDO BANDEJA", fg_color="#10b981")
-                self.btn_toggle_listen.configure(
-                    text="⏹ DETENER ESCUCHA",
-                    fg_color="#ef4444",
-                    hover_color="#dc2626"
-                )
+                if self.lbl_session_badge.cget("text") != "ESCUCHANDO BANDEJA":
+                    self.lbl_session_badge.configure(text="ESCUCHANDO BANDEJA", fg_color="#10b981")
+                if self.btn_toggle_listen.cget("text") != "⏹ DETENER ESCUCHA":
+                    self.btn_toggle_listen.configure(
+                        text="⏹ DETENER ESCUCHA",
+                        fg_color="#ef4444",
+                        hover_color="#dc2626"
+                    )
             else:
-                self.lbl_session_badge.configure(text="INACTIVO", fg_color="gray30")
-                self.btn_toggle_listen.configure(
-                    text="▶ INICIAR ESCUCHA AUTOMÁTICA",
-                    fg_color="#059669",
-                    hover_color="#047857"
-                )
+                if self.lbl_session_badge.cget("text") != "INACTIVO":
+                    self.lbl_session_badge.configure(text="INACTIVO", fg_color="gray30")
+                if self.btn_toggle_listen.cget("text") != "▶ INICIAR ESCUCHA AUTOMÁTICA":
+                    self.btn_toggle_listen.configure(
+                        text="▶ INICIAR ESCUCHA AUTOMÁTICA",
+                        fg_color="#059669",
+                        hover_color="#047857"
+                    )
 
             self.lbl_batch_counter.configure(text=f"Lotes procesados hoy: {status['total_batches_processed']}")
 
-            # 2. Manejar alertas activas
+            # 2. Manejo de alertas múltiples
             active_alerts = status.get("active_alerts", [])
             if active_alerts:
-                latest_alert = active_alerts[-1]
-                self.current_alert_data = latest_alert
-                self.lbl_alert_msg.configure(text=f"{latest_alert['title']}: {latest_alert['message']}")
+                if self._active_alert_index >= len(active_alerts):
+                    self._active_alert_index = 0
+                alert_item = active_alerts[self._active_alert_index]
+                self.current_alert_data = alert_item
+                self.lbl_alert_counter.configure(text=f"[{self._active_alert_index + 1}/{len(active_alerts)}]")
+                self.lbl_alert_msg.configure(text=f"{alert_item['title']}: {alert_item['message']}")
+
+                if len(active_alerts) > 1:
+                    self.btn_alert_next.configure(state="normal")
+                else:
+                    self.btn_alert_next.configure(state="disabled")
+
                 if not self.alert_frame.winfo_ismapped():
                     self.alert_frame.pack(fill="x", padx=16, pady=(0, 6), before=self.main_content)
             else:
@@ -1044,7 +1130,7 @@ class VeriDocsDesktopApp(ctk.CTk):
                     self.progress_frame.pack_forget()
 
                 last_b = status.get("last_batch")
-                if last_b:
+                if last_b and not self.currently_viewed_batch:
                     batch_key = f"{last_b.get('of')}_{len(last_b.get('created_files', []))}_{last_b.get('destination_dir')}"
                     if batch_key != self.last_rendered_batch_key:
                         self.last_rendered_batch_key = batch_key
@@ -1052,18 +1138,21 @@ class VeriDocsDesktopApp(ctk.CTk):
                         self.render_created_files_list(last_b.get("created_files", []))
                         self.btn_open_batch_folder.configure(state="normal", fg_color="#059669")
                         self.btn_copy_batch_path.configure(state="normal")
+                        if last_b.get("ot_replica_path"):
+                            self.btn_open_ot_folder.configure(state="normal", fg_color="#4338ca")
 
-            # 4. Actualizar historial de lotes si ha cambiado
-            batches = status.get("batches_history", [])
-            if len(batches) != self.seen_batches_count:
-                self.seen_batches_count = len(batches)
+            # 4. Actualizar historial de lotes con ID monotónico (nunca se congela)
+            last_b_id = status.get("last_batch_id", 0)
+            if last_b_id != self.last_seen_batch_id:
+                self.last_seen_batch_id = last_b_id
+                batches = status.get("batches_history", [])
                 self.lbl_hist_title.configure(text=f"Lotes Procesados ({len(batches)})")
                 self.render_history_list(batches)
 
-            # 5. Actualizar consola de registro incrementalmente (sin recrear widgets)
+            # 5. Actualizar consola de registro incrementalmente con ID (nunca se congela)
             events = status.get("events_log", [])
-            if len(events) > self.seen_log_count:
-                new_events = events[self.seen_log_count:]
+            new_events = [ev for ev in events if ev.get("id", 0) > self.last_seen_event_id]
+            if new_events:
                 for ev in new_events:
                     t = ev.get("time", "")
                     m = ev.get("message", "")
@@ -1071,7 +1160,7 @@ class VeriDocsDesktopApp(ctk.CTk):
                     tag = lvl if lvl in ("SUCCESS", "WARNING", "ERROR") else "INFO"
                     line = f"[{t}] [{lvl}] {m}\n"
                     self.log_textbox.insert("end", line, tag)
-                self.seen_log_count = len(events)
+                    self.last_seen_event_id = max(self.last_seen_event_id, ev.get("id", 0))
                 self.log_textbox.see("end")
 
         except Exception as e:
@@ -1079,13 +1168,23 @@ class VeriDocsDesktopApp(ctk.CTk):
         finally:
             self.after(1000, self.poll_session_status)
 
+    def cycle_next_alert(self):
+        status = self.session_manager.get_status()
+        alerts = status.get("active_alerts", [])
+        if alerts:
+            self._active_alert_index = (self._active_alert_index + 1) % len(alerts)
+            alert_item = alerts[self._active_alert_index]
+            self.current_alert_data = alert_item
+            self.lbl_alert_counter.configure(text=f"[{self._active_alert_index + 1}/{len(alerts)}]")
+            self.lbl_alert_msg.configure(text=f"{alert_item['title']}: {alert_item['message']}")
+
     def render_batch_summary(self, last_b: dict):
         of_str = last_b.get("of", "")
         o_info = last_b.get("order_info", {})
         col_e = o_info.get("pedido_odoo", "")
         col_i = o_info.get("descripcion", "")
         col_cli = o_info.get("cliente", "")
-        dest_dir = last_b.get("destination_dir", "")
+        dest_dir = last_b.get("destination_dir") or last_b.get("dest_dir", "")
         t_pages = last_b.get("total_pages", 0)
 
         title_text = f"OF: {of_str}  |  Odoo: {col_e or '(N/A)'}  |  Total: {t_pages} páginas"
@@ -1095,8 +1194,15 @@ class VeriDocsDesktopApp(ctk.CTk):
         desc_tag = f"Descripción: {col_i or '(Sin descripción)'}{cli_tag}"
         self.lbl_batch_sub.configure(text=f"{desc_tag}\nCarpeta: {dest_dir}")
 
+        ot_replica = last_b.get("ot_replica_path")
+        if ot_replica:
+            self.lbl_ot_status.configure(text=f"✓ Replicado en Oficina Técnica: {ot_replica}")
+            self.btn_open_ot_folder.configure(state="normal", fg_color="#4338ca")
+        else:
+            self.lbl_ot_status.configure(text="")
+            self.btn_open_ot_folder.configure(state="disabled", fg_color="gray30")
+
     def render_created_files_list(self, files: list):
-        """Renderiza las tarjetas de archivos generados con opción de apertura por doble clic."""
         for w in self.files_scroll.winfo_children():
             w.destroy()
 
@@ -1188,17 +1294,17 @@ class VeriDocsDesktopApp(ctk.CTk):
             messagebox.showinfo("Aviso", f"El archivo ya no está disponible en la ruta especificada:\n{fpath}")
 
     def copy_current_batch_folder(self):
-        status = self.session_manager.get_status()
-        last_b = status.get("last_batch")
-        if last_b and last_b.get("destination_dir"):
-            copy_to_clipboard(self, last_b["destination_dir"], self.btn_copy_batch_path)
+        target_b = self.currently_viewed_batch or self.session_manager.get_status().get("last_batch")
+        if target_b:
+            folder = target_b.get("destination_dir") or target_b.get("dest_dir", "")
+            if folder:
+                copy_to_clipboard(self, folder, self.btn_copy_batch_path)
 
     def open_current_batch_folder(self):
-        status = self.session_manager.get_status()
-        last_b = status.get("last_batch")
-        if last_b and last_b.get("destination_dir"):
-            folder = last_b["destination_dir"]
-            if os.path.exists(folder):
+        target_b = self.currently_viewed_batch or self.session_manager.get_status().get("last_batch")
+        if target_b:
+            folder = target_b.get("destination_dir") or target_b.get("dest_dir", "")
+            if folder and os.path.exists(folder):
                 os.startfile(folder)
             else:
                 messagebox.showinfo("Aviso", f"La carpeta aún no está disponible: {folder}")
@@ -1207,6 +1313,15 @@ class VeriDocsDesktopApp(ctk.CTk):
                 "Información",
                 "Aún no se ha procesado ningún lote de escaneo en esta sesión.\n\nEn cuanto se procese un dossier, podrás abrir su carpeta directamente desde aquí."
             )
+
+    def open_current_batch_ot_folder(self):
+        target_b = self.currently_viewed_batch or self.session_manager.get_status().get("last_batch")
+        if target_b and target_b.get("ot_replica_path"):
+            folder = target_b["ot_replica_path"]
+            if os.path.exists(folder):
+                os.startfile(folder)
+            else:
+                messagebox.showinfo("Oficina Técnica", f"La ruta de réplica no está accesible:\n{folder}")
 
     def dismiss_current_alert(self):
         if self.current_alert_data:
@@ -1231,10 +1346,15 @@ class VeriDocsDesktopApp(ctk.CTk):
     def clear_log_console(self):
         self.log_textbox.delete("1.0", "end")
 
-    # Búsqueda de pedidos en Aktis
+    # Búsqueda debounced en Aktis
     def on_of_search_typing(self, event=None):
         if event and event.keysym in ("Return", "KP_Enter", "Up", "Down"):
             return
+        if self._search_timer:
+            self.after_cancel(self._search_timer)
+        self._search_timer = self.after(250, self._do_debounced_search)
+
+    def _do_debounced_search(self):
         val = self.of_entry.get().strip()
         if len(val) >= 2:
             matches = self.excel_manager.search(val)
@@ -1310,68 +1430,75 @@ class VeriDocsDesktopApp(ctk.CTk):
         threading.Thread(target=_reload, daemon=True).start()
 
     def check_system_connectivity(self):
-        """Comprobación de conectividad a redes de forma asíncrona para evitar que la UI se cuelgue."""
         def _worker():
             cfg = load_config()
             excel_path = cfg.get("excel_path", "")
             escaneos_folder = cfg.get("escaneos_folder", "")
+            ot_base = cfg.get("oficina_tecnica_base", r"\\172.30.0.10\Oficina_tecnica")
 
             try:
                 ex_ok = bool(excel_path and os.path.exists(excel_path))
             except Exception:
                 ex_ok = False
 
+            pending_count = 0
             try:
                 fo_ok = bool(escaneos_folder and os.path.exists(escaneos_folder))
+                if fo_ok:
+                    pending_count = sum(1 for e in os.scandir(escaneos_folder) if e.is_file() and e.name.lower().endswith(".pdf") and not e.name.startswith("_"))
             except Exception:
                 fo_ok = False
+
+            try:
+                ot_ok = bool(ot_base and os.path.exists(ot_base))
+            except Exception:
+                ot_ok = False
 
             ocr_ok, _ = is_ocr_available()
             ocr_en = cfg.get("ocr_enabled", True)
 
             try:
-                self.after(0, lambda: self._apply_connectivity_ui(ex_ok, fo_ok, ocr_ok, ocr_en))
+                self.after(0, lambda: self._apply_connectivity_ui(ex_ok, fo_ok, ot_ok, ocr_ok, ocr_en, pending_count))
             except Exception:
                 pass
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _apply_connectivity_ui(self, ex_ok: bool, fo_ok: bool, ocr_ok: bool, ocr_en: bool):
+    def _apply_connectivity_ui(self, ex_ok: bool, fo_ok: bool, ot_ok: bool, ocr_ok: bool, ocr_en: bool, pending_count: int):
         self.pill_excel.configure(
-            text="● Excel: Conectado" if ex_ok else "● Excel: No accesible",
+            text="● Excel: OK" if ex_ok else "● Excel: No accesible",
             fg_color="#064e3b" if ex_ok else "#7f1d1d",
             text_color="#34d399" if ex_ok else "#fca5a5"
         )
         self.pill_folder.configure(
-            text="● Bandeja: OK" if fo_ok else "● Bandeja: No accesible",
+            text="● Escaneos: OK" if fo_ok else "● Escaneos: No accesible",
             fg_color="#064e3b" if fo_ok else "#7f1d1d",
             text_color="#34d399" if fo_ok else "#fca5a5"
         )
+        self.pill_ot.configure(
+            text="● OT: OK" if ot_ok else "● OT: No accesible",
+            fg_color="#064e3b" if ot_ok else "#7f1d1d",
+            text_color="#34d399" if ot_ok else "#fca5a5"
+        )
+        self.pill_queue.configure(
+            text=f"● Bandeja: {pending_count} pend.",
+            fg_color="#78350f" if pending_count > 0 else "#064e3b",
+            text_color="#fcd34d" if pending_count > 0 else "#34d399"
+        )
+
         if not ocr_ok:
-            self.pill_ocr.configure(
-                text="● OCR: No disp.",
-                fg_color="#7f1d1d",
-                text_color="#fca5a5"
-            )
+            self.pill_ocr.configure(text="● OCR: No disp.", fg_color="#7f1d1d", text_color="#fca5a5")
         elif not ocr_en:
-            self.pill_ocr.configure(
-                text="● OCR: Inactivo",
-                fg_color="#78350f",
-                text_color="#fcd34d"
-            )
+            self.pill_ocr.configure(text="● OCR: Inactivo", fg_color="#78350f", text_color="#fcd34d")
         else:
-            self.pill_ocr.configure(
-                text="● OCR: Activo",
-                fg_color="#064e3b",
-                text_color="#34d399"
-            )
+            self.pill_ocr.configure(text="● OCR: Activo", fg_color="#064e3b", text_color="#34d399")
 
     def open_settings_dialog(self):
         cfg = load_config()
         dlg = ctk.CTkToplevel(self)
         dlg.title("Configuración de VeriDocs")
-        dlg.geometry("640x590")
-        dlg.minsize(550, 540)
+        dlg.geometry("680x620")
+        dlg.minsize(580, 560)
         dlg.grab_set()
 
         tabview = ctk.CTkTabview(dlg)
@@ -1380,26 +1507,58 @@ class VeriDocsDesktopApp(ctk.CTk):
         tab_paths = tabview.add("📁 Rutas de Red")
         tab_ocr = tabview.add("🔍 Parámetros OCR")
 
-        # --- TAB 1: RUTAS ---
+        # --- TAB 1: RUTAS con botones Examinar ---
         ctk.CTkLabel(tab_paths, text="Ruta del archivo Excel (Pedidos en curso Aktis):", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(8, 2))
-        entry_excel = ctk.CTkEntry(tab_paths, width=580)
+        row_ex = ctk.CTkFrame(tab_paths, fg_color="transparent")
+        row_ex.pack(fill="x", pady=(0, 10))
+        entry_excel = ctk.CTkEntry(row_ex)
         entry_excel.insert(0, cfg.get("excel_path", ""))
-        entry_excel.pack(fill="x", pady=(0, 10))
+        entry_excel.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        def browse_excel():
+            f = filedialog.askopenfilename(title="Seleccionar archivo Excel Aktis", filetypes=[("Excel", "*.xlsm;*.xlsx")])
+            if f:
+                entry_excel.delete(0, "end")
+                entry_excel.insert(0, f)
+        ctk.CTkButton(row_ex, text="Examinar...", width=95, command=browse_excel).pack(side="right")
 
         ctk.CTkLabel(tab_paths, text="Carpeta de entrada (bandeja de escaneos):", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(4, 2))
-        entry_scan = ctk.CTkEntry(tab_paths, width=580)
+        row_sc = ctk.CTkFrame(tab_paths, fg_color="transparent")
+        row_sc.pack(fill="x", pady=(0, 10))
+        entry_scan = ctk.CTkEntry(row_sc)
         entry_scan.insert(0, cfg.get("escaneos_folder", ""))
-        entry_scan.pack(fill="x", pady=(0, 10))
+        entry_scan.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        def browse_scan():
+            d = filedialog.askdirectory(title="Seleccionar bandeja de escaneos")
+            if d:
+                entry_scan.delete(0, "end")
+                entry_scan.insert(0, d)
+        ctk.CTkButton(row_sc, text="Examinar...", width=95, command=browse_scan).pack(side="right")
 
         ctk.CTkLabel(tab_paths, text="Carpeta base de destino (donde se crearán las carpetas de las OFs):", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(4, 2))
-        entry_dest = ctk.CTkEntry(tab_paths, width=580)
+        row_dst = ctk.CTkFrame(tab_paths, fg_color="transparent")
+        row_dst.pack(fill="x", pady=(0, 10))
+        entry_dest = ctk.CTkEntry(row_dst)
         entry_dest.insert(0, cfg.get("destination_base_folder", ""))
-        entry_dest.pack(fill="x", pady=(0, 10))
+        entry_dest.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        def browse_dest():
+            d = filedialog.askdirectory(title="Seleccionar carpeta base destino")
+            if d:
+                entry_dest.delete(0, "end")
+                entry_dest.insert(0, d)
+        ctk.CTkButton(row_dst, text="Examinar...", width=95, command=browse_dest).pack(side="right")
 
         ctk.CTkLabel(tab_paths, text="Carpeta base de Oficina Técnica (red de proyectos):", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(4, 2))
-        entry_ot = ctk.CTkEntry(tab_paths, width=580)
+        row_ot = ctk.CTkFrame(tab_paths, fg_color="transparent")
+        row_ot.pack(fill="x", pady=(0, 10))
+        entry_ot = ctk.CTkEntry(row_ot)
         entry_ot.insert(0, cfg.get("oficina_tecnica_base", r"\\172.30.0.10\Oficina_tecnica"))
-        entry_ot.pack(fill="x", pady=(0, 10))
+        entry_ot.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        def browse_ot():
+            d = filedialog.askdirectory(title="Seleccionar carpeta base de Oficina Técnica")
+            if d:
+                entry_ot.delete(0, "end")
+                entry_ot.insert(0, d)
+        ctk.CTkButton(row_ot, text="Examinar...", width=95, command=browse_ot).pack(side="right")
 
         copy_ot_var = ctk.BooleanVar(value=cfg.get("copy_to_oficina_tecnica", True))
         chk_ot = ctk.CTkSwitch(
@@ -1410,7 +1569,7 @@ class VeriDocsDesktopApp(ctk.CTk):
         )
         chk_ot.pack(anchor="w", pady=(6, 10))
 
-        # --- TAB 2: OCR ---
+        # --- TAB 2: OCR y Escaneo ---
         ocr_enabled_var = ctk.BooleanVar(value=cfg.get("ocr_enabled", True))
         chk_ocr = ctk.CTkSwitch(
             tab_ocr,
@@ -1418,7 +1577,16 @@ class VeriDocsDesktopApp(ctk.CTk):
             variable=ocr_enabled_var,
             font=ctk.CTkFont(weight="bold")
         )
-        chk_ocr.pack(anchor="w", pady=(10, 12))
+        chk_ocr.pack(anchor="w", pady=(10, 8))
+
+        duplex_var = ctk.BooleanVar(value=cfg.get("duplex_mode", True))
+        chk_duplex = ctk.CTkSwitch(
+            tab_ocr,
+            text="Modo Dúplex (Doble Cara) con descarte automático de reversos vacíos",
+            variable=duplex_var,
+            font=ctk.CTkFont(weight="bold")
+        )
+        chk_duplex.pack(anchor="w", pady=(4, 12))
 
         row_header = ctk.CTkFrame(tab_ocr, fg_color="transparent")
         row_header.pack(fill="x", pady=6)
@@ -1437,9 +1605,17 @@ class VeriDocsDesktopApp(ctk.CTk):
         ctk.CTkLabel(row_h, text="(Recomendado: 12% - 15%)", text_color="gray").pack(side="left", padx=8)
 
         ctk.CTkLabel(tab_ocr, text="Ruta del Excel de códigos oficiales (codigosOCR.xlsx):", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(10, 2))
-        entry_cat = ctk.CTkEntry(tab_ocr, width=580)
+        row_cat = ctk.CTkFrame(tab_ocr, fg_color="transparent")
+        row_cat.pack(fill="x", pady=(0, 10))
+        entry_cat = ctk.CTkEntry(row_cat)
         entry_cat.insert(0, cfg.get("ocr_catalog_path", "codigosOCR.xlsx"))
-        entry_cat.pack(fill="x", pady=(0, 10))
+        entry_cat.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        def browse_cat():
+            f = filedialog.askopenfilename(title="Seleccionar catálogo de códigos", filetypes=[("Excel", "*.xlsx")])
+            if f:
+                entry_cat.delete(0, "end")
+                entry_cat.insert(0, f)
+        ctk.CTkButton(row_cat, text="Examinar...", width=95, command=browse_cat).pack(side="right")
 
         # Botones de Acción
         btn_box = ctk.CTkFrame(dlg, fg_color="transparent")
@@ -1463,6 +1639,7 @@ class VeriDocsDesktopApp(ctk.CTk):
                 "oficina_tecnica_base": entry_ot.get().strip(),
                 "copy_to_oficina_tecnica": copy_ot_var.get(),
                 "ocr_enabled": ocr_enabled_var.get(),
+                "duplex_mode": duplex_var.get(),
                 "ocr_header_height_percent": head_val,
                 "ocr_footer_height_percent": foot_val,
                 "ocr_catalog_path": entry_cat.get().strip()
@@ -1472,7 +1649,7 @@ class VeriDocsDesktopApp(ctk.CTk):
             cfg_curr.update(new_config)
             if save_config(cfg_curr):
                 dlg.destroy()
-                self.reload_catalog()
+                self.reload_catalog(show_msg=False)
                 self.check_system_connectivity()
                 messagebox.showinfo("Configuración", "Configuración guardada correctamente.")
             else:

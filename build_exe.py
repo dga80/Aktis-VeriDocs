@@ -18,6 +18,7 @@ def build():
         "--collect-all", "winocr",
         "--collect-all", "winrt",
         "--collect-all", "pypdfium2",
+        "--collect-all", "openpyxl",
         "--add-data", "config.json;.",
         "--add-data", "codigosOCR.xlsx;.",
         "app_gui.py"

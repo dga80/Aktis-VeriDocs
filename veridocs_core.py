@@ -62,6 +62,7 @@ def get_effective_documents_def():
 
 _cached_catalog = None
 _catalog_mtime = 0
+_catalog_lock = threading.Lock()
 
 
 def sanitize_filename(text: Any) -> str:
@@ -69,9 +70,7 @@ def sanitize_filename(text: Any) -> str:
     if text is None:
         return ""
     text = str(text).strip()
-    # Reemplazar barras, dos puntos y caracteres ilegales por guión
     text = re.sub(r'[\\/:*?"<>|]', '-', text)
-    # Colapsar espacios múltiples y guiones consecutivos
     text = re.sub(r'\s+', ' ', text)
     text = re.sub(r'-+', '-', text)
     return text.strip(' -.')
@@ -81,13 +80,13 @@ def load_ocr_catalog(catalog_path: Optional[str] = None) -> List[Dict[str, Any]]
     """
     Carga todos los tipos de documentos posibles desde codigosOCR.xlsx.
     Identifica de forma dinámica el código, el nombre y si es tipo incidencia.
+    Recarga automáticamente si el archivo fue modificado.
     """
     global _cached_catalog, _catalog_mtime
 
     cfg = load_config()
     target_path = catalog_path or cfg.get("ocr_catalog_path", "codigosOCR.xlsx")
 
-    # Si la ruta es relativa, resolverla respecto al directorio de la aplicación
     if not os.path.isabs(target_path):
         base_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
         cand_path = os.path.join(base_dir, target_path)
@@ -97,46 +96,43 @@ def load_ocr_catalog(catalog_path: Optional[str] = None) -> List[Dict[str, Any]]
             target_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), target_path)
 
     if not os.path.exists(target_path):
-        print(f"[load_ocr_catalog] Archivo {target_path} no encontrado. Usando catálogo predeterminado.")
         return DEFAULT_FALLBACK_CATALOG.copy()
 
-    try:
-        current_mtime = os.path.getmtime(target_path)
-        if _cached_catalog is not None and current_mtime == _catalog_mtime:
-            return _cached_catalog
+    with _catalog_lock:
+        try:
+            current_mtime = os.path.getmtime(target_path)
+            if _cached_catalog is not None and current_mtime == _catalog_mtime:
+                return _cached_catalog
 
-        wb = openpyxl.load_workbook(target_path, data_only=True, read_only=True)
-        ws = wb.active
+            wb = openpyxl.load_workbook(target_path, data_only=True, read_only=True)
+            ws = wb.active
 
-        catalog = []
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if not row or len(row) < 2:
-                continue
-            code_raw = row[0]
-            doc_raw = row[1]
-            if not code_raw or not doc_raw:
-                continue
+            catalog = []
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                if not row or len(row) < 2:
+                    continue
+                code_raw = row[0]
+                doc_raw = row[1]
+                if not code_raw or not doc_raw:
+                    continue
 
-            code_str = str(code_raw).strip()
-            doc_str = str(doc_raw).strip()
-            
-            # Detectar si es tipo Incidencia (código DC-0020, DC-0022 o palabra 'incidencia')
-            is_inc = ("incidencia" in doc_str.lower()) or (code_str.upper() in ("DC-0020", "DC-0022"))
+                code_str = str(code_raw).strip()
+                doc_str = str(doc_raw).strip()
+                is_inc = ("incidencia" in doc_str.lower()) or (code_str.upper() in ("DC-0020", "DC-0022"))
 
-            catalog.append({
-                "codigo": code_str,
-                "documento": doc_str,
-                "is_incidencia": is_inc
-            })
+                catalog.append({
+                    "codigo": code_str,
+                    "documento": doc_str,
+                    "is_incidencia": is_inc
+                })
 
-        wb.close()
-        if catalog:
-            _cached_catalog = catalog
-            _catalog_mtime = current_mtime
-            print(f"[load_ocr_catalog] Cargados exitosamente {len(catalog)} códigos de documentos desde Excel.")
-            return _cached_catalog
-    except Exception as e:
-        print(f"[load_ocr_catalog] Error leyendo {target_path}: {e}")
+            wb.close()
+            if catalog:
+                _cached_catalog = catalog
+                _catalog_mtime = current_mtime
+                return _cached_catalog
+        except Exception as e:
+            print(f"[load_ocr_catalog] Error leyendo {target_path}: {e}")
 
     return DEFAULT_FALLBACK_CATALOG.copy()
 
@@ -160,7 +156,6 @@ def is_file_ready(filepath: str, check_interval: float = 0.5, max_checks: int = 
                 stable_count = 0
             last_size = size
 
-            # Si el tamaño se mantiene estable y podemos abrir el archivo exclusivamente
             if stable_count >= 2:
                 try:
                     with open(filepath, "r+b") as f:
@@ -198,23 +193,12 @@ class ExcelManager:
 
             orders = []
             try:
-                # Abrir en modo solo lectura para no bloquear el archivo
                 wb = openpyxl.load_workbook(excel_path, data_only=True, read_only=True)
                 if sheet_name in wb.sheetnames:
                     ws = wb[sheet_name]
                 else:
                     ws = wb.active
 
-                # Columnas (1-based index):
-                # A: 1 COMPAÑÍA
-                # B: 2 Código cliente
-                # C: 3 Cliente
-                # D: 4 Pedido CLIENTES
-                # E: 5 Pedido ODOO
-                # F: 6 Código artículo
-                # G: 7 SB… (Subartículo/Subpedido)
-                # H: 8 Nº OF
-                # I: 9 Descripción
                 for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
                     if not row or len(row) < 8:
                         continue
@@ -224,7 +208,7 @@ class ExcelManager:
                         continue
 
                     of_str = str(of_raw).strip()
-                    if of_str.upper() == "PTE" or of_str == "-" or of_str == "":
+                    if of_str.upper() in ("PTE", "PENDIENTE", "NONE", "-", ""):
                         continue
 
                     pedido_odoo = str(row[4]).strip() if len(row) > 4 and row[4] is not None else ""
@@ -273,10 +257,6 @@ class ExcelManager:
         return results
 
     def find_by_of(self, of_query: str) -> Optional[Dict[str, Any]]:
-        r"""
-        Búsqueda robusta de una OF en el listado de pedidos en curso.
-        Admite variaciones de separadores (/ o - o \), ceros a la izquierda y número final.
-        """
         if not of_query:
             return None
 
@@ -285,15 +265,14 @@ class ExcelManager:
         q_norm = q_raw.replace('\\', '/').replace('-', '/')
         q_sanitized = sanitize_filename(q_raw).upper()
 
-        # 1. Coincidencia exacta (original o normalizada)
+        # 1. Coincidencia exacta
         for o in orders:
             o_of = o["of"].upper()
             o_norm = o_of.replace('\\', '/').replace('-', '/')
             if o_of == q_raw or o_norm == q_norm or o["of_sanitized"].upper() == q_sanitized:
                 return o
 
-        # 2. Coincidencia por número final (ej: '00560' o '560' -> 'AYC/MO/00560')
-        # Extraer los dígitos finales de la consulta
+        # 2. Coincidencia por número final
         match_digits = re.search(r'(\d{3,6})$', q_raw)
         if match_digits:
             q_num_str = match_digits.group(1)
@@ -302,7 +281,6 @@ class ExcelManager:
                 parts = o["of"].replace('\\', '/').replace('-', '/').split('/')
                 last_part = parts[-1].strip()
                 if last_part.isdigit() and int(last_part) == q_num_int:
-                    # Si la consulta además contenía prefijo, verificar que coincida
                     prefix_match = re.match(r'^([A-Z0-9]+)', q_raw)
                     if prefix_match:
                         pref = prefix_match.group(1)
@@ -311,7 +289,7 @@ class ExcelManager:
                     else:
                         return o
 
-        # 3. Coincidencia si termina con la cadena ingresada
+        # 3. Coincidencia por terminación
         for o in orders:
             if o["of"].upper().endswith(q_raw) or o["of_sanitized"].upper().endswith(q_sanitized):
                 return o
@@ -344,8 +322,6 @@ KNOWN_CLIENT_ALIASES = {
     "SCHNEIDER ELECTRIC SYSTEM": "SCHNEIDER SESI",
 }
 
-
-# Nombres normalizados y resumidos según los estándares del servidor
 SHORT_DOC_NAMES = {
     "DC-0018": "Carros Mat",
     "DC-0019": "Orden de Fabricacion",
@@ -406,10 +382,7 @@ def norm_search_token(s: Any) -> str:
 
 
 def to_windows_long_path(p: str) -> str:
-    """
-    Convierte una ruta a formato extendido de Windows (\\\\?\\ o \\\\?\\UNC\\)
-    para soportar rutas que superen los 260 caracteres (límite MAX_PATH) en Windows.
-    """
+    """Convierte una ruta a formato extendido de Windows (\\\\?\\) para soportar >260 caracteres."""
     if not p or not isinstance(p, str):
         return p
     if os.name != 'nt':
@@ -423,13 +396,7 @@ def to_windows_long_path(p: str) -> str:
 
 
 def sort_year_folders(folders: List[str]) -> List[str]:
-    r"""
-    Ordena carpetas con referencias a años con la siguiente prioridad dinámica:
-    1. Año siguiente al actual (datetime.now().year + 1, ej: 2027 si estamos en 2026)
-    2. Año actual (datetime.now().year, ej: 2026)
-    3. Años anteriores en orden descendente (2025, 2024, ...)
-    4. Otros años futuros si los hubiera, en orden descendente.
-    """
+    """Ordena carpetas con referencias a años con prioridad dinámica."""
     cur_year = datetime.now().year
     next_year = cur_year + 1
 
@@ -456,12 +423,7 @@ def find_oficina_tecnica_project_path(
     order_info: Optional[Dict[str, Any]] = None,
     base_ot_path: Optional[str] = None
 ) -> Tuple[Optional[str], str, bool]:
-    r"""
-    Localiza la ruta del proyecto en Oficina Técnica en base a la OF y datos de Aktis.
-    Retorna: (target_path, debug_info_msg, is_direct_dump)
-    - Para McDonald's: target_path es 'SubCuadro' o 'Cuadro General' dentro de 05, is_direct_dump=True.
-    - Para proyectos generales: target_path es '05-Documentacion final', is_direct_dump=False.
-    """
+    """Localiza la ruta del proyecto en Oficina Técnica en base a la OF y datos de Aktis."""
     if not base_ot_path:
         cfg = load_config()
         base_ot_path = cfg.get("oficina_tecnica_base", r"\\172.30.0.10\Oficina_tecnica")
@@ -469,7 +431,6 @@ def find_oficina_tecnica_project_path(
     if not os.path.isdir(base_ot_path):
         return None, f"Ruta base de Oficina Técnica no accesible: '{base_ot_path}'", False
 
-    # 1. Identificar empresa / prefijo de la OF (AYC, MES, LOESS, CESA, CTI...)
     m_pref = re.match(r'^([A-Za-z0-9_-]{2,10})[/\\-]', of_str.strip())
     prefix = m_pref.group(1).upper() if m_pref else of_str.split('/')[0].split('-')[0].upper().strip()
 
@@ -494,9 +455,7 @@ def find_oficina_tecnica_project_path(
     raw_desc = (order_info.get("descripcion") or "") if order_info else ""
     sb_val = (order_info.get("sb") or "").strip() if order_info else ""
 
-    # =========================================================================
-    # CASO ESPECIAL: MES Mc Donald's (MCD)
-    # =========================================================================
+    # Caso especial McDonald's
     is_mcd = bool("MCD" in raw_desc.upper() or "MCDONALD" in raw_client.upper() or "MC DONALD" in raw_client.upper())
     if is_mcd and (prefix == "MES" or "01-MES" in company_folder):
         mcd_client_folder = None
@@ -512,7 +471,6 @@ def find_oficina_tecnica_project_path(
         if not os.path.isdir(mcd_client_path):
             return None, f"No existe la carpeta de McDonald's: '{mcd_client_path}'", False
 
-        # Macro carpeta anual (ej: 'Proyectos 2026 M03376' o 'Proyectos 2027 ...')
         m_macro = re.search(r'[A-Z]\d{5}', sb_val)
         macro_code = m_macro.group(0).upper() if m_macro else ""
 
@@ -522,7 +480,6 @@ def find_oficina_tecnica_project_path(
         if not sorted_macros:
             return None, f"No se encontró carpeta anual en '{mcd_client_path}'", False
 
-        # Si tenemos código macro (ej: M03376), priorizar las carpetas que lo contengan
         ordered_macro_cands = []
         if macro_code:
             ordered_macro_cands.extend([m for m in sorted_macros if macro_code in m.upper()])
@@ -530,7 +487,6 @@ def find_oficina_tecnica_project_path(
             if m not in ordered_macro_cands:
                 ordered_macro_cands.append(m)
 
-        # Identificar si es Subcuadro o Cuadro General a partir del SB de Columna G
         clean_sb = re.sub(r'[^A-Za-z0-9]', '', sb_val).upper()
         is_subcuadro = clean_sb.endswith('A') or ("SUBCUADRO" in raw_desc.upper() and "A" in sb_val.upper())
         base_project_code = clean_sb[:-1] if clean_sb.endswith('A') else clean_sb
@@ -597,9 +553,7 @@ def find_oficina_tecnica_project_path(
 
         return target_dump, "OK", True
 
-    # =========================================================================
-    # PROYECTOS GENERALES (AYC, MES, LOESS, CESA...)
-    # =========================================================================
+    # Proyectos generales
     if not raw_client:
         return None, "No hay cliente informado en los datos de Aktis", False
 
@@ -655,7 +609,6 @@ def find_oficina_tecnica_project_path(
             continue
 
         year_subdirs = sort_year_folders([d for d in entries if os.path.isdir(to_windows_long_path(os.path.join(client_path, d)))])
-
         search_paths = [os.path.join(client_path, y) for y in year_subdirs] if year_subdirs else [client_path]
 
         for sp in search_paths:
@@ -718,11 +671,7 @@ def replicate_to_oficina_tecnica(
     dest_dir: str,
     log_callback: Optional[Callable[[str, str], None]] = None
 ) -> Optional[str]:
-    """
-    Replica los PDFs generados en la carpeta correspondiente de Oficina Técnica:
-    - En McDonald's: directamente dentro de 'SubCuadro' o 'Cuadro General'.
-    - En proyectos generales: dentro de '05-Documentacion final' en su subcarpeta de OF.
-    """
+    """Replica los PDFs generados en la carpeta correspondiente de Oficina Técnica."""
     def log(msg: str, level: str = "info"):
         if log_callback:
             log_callback(msg, level)
@@ -746,7 +695,6 @@ def replicate_to_oficina_tecnica(
         long_doc_final = to_windows_long_path(doc_final_path)
 
         if is_direct_dump:
-            # En McDonald's (SubCuadro o Cuadro General), los PDFs se vuelcan directamente en esa carpeta
             os.makedirs(long_doc_final, exist_ok=True)
             for item in os.listdir(long_dest_dir):
                 if item.startswith("_ORIGINAL"):
@@ -759,7 +707,6 @@ def replicate_to_oficina_tecnica(
             log(f"  📁 Copia replicada en Oficina Técnica [{os.path.basename(doc_final_path)}]: {count} archivos -> '{doc_final_path}'", "success")
             return doc_final_path
         else:
-            # En proyectos generales, replicar la carpeta completa de la OF dentro de 05-Documentacion final
             folder_name = os.path.basename(dest_dir)
             ot_target = os.path.join(doc_final_path, folder_name)
             long_ot_target = to_windows_long_path(ot_target)
@@ -787,17 +734,17 @@ def process_scanned_pdf(
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None
 ) -> Dict[str, Any]:
     """
-    Motor central del nuevo flujo de VeriDocs:
-    1. Lee la cabecera (30%) de la página 1 con OCR para extraer la OF.
-    2. Busca la OF en el Excel de Aktis para obtener Pedido ODOO, Descripción, etc.
-    3. Analiza el pie de página de cada hoja del PDF contra codigosOCR.xlsx.
-    4. Gestión DÚPLEX (doble cara): Mantiene ambas caras únicamente para Pruebas FAT (DC-0034 y DC-0035).
-       Para el resto de códigos elimina automáticamente las caras en blanco (reversos dúplex).
-    5. Agrupa páginas con el mismo código en un único PDF.
-    6. Para Incidencias (DC-0020, DC-0022), si hay más de 1 página genera documentos separados (1-3, 2-3, 3-3).
-       Se duplican en la carpeta 'incidencias' únicamente las páginas con código DC-0022 (DC-0020 no).
-    7. Guarda páginas no reconocidas en un PDF de revisión y genera alerta.
-    8. Guarda todo en la carpeta destino de la OF y archiva el PDF original escaneado.
+    Motor central de VeriDocs:
+    1. Lee la cabecera (pág 1) para detectar la OF.
+    2. Conecta con Aktis para obtener Pedido ODOO, Descripción, etc.
+    3. Analiza el pie de cada hoja contra codigosOCR.xlsx.
+    4. Gestión DÚPLEX segura:
+       - Si duplex_mode es False: procesa cada página por separado (sin descartar reverso).
+       - Si duplex_mode es True: mantiene ambas caras para Pruebas FAT (DC-0034/DC-0035).
+         Para el resto, si la segunda cara tiene código OCR reconocido válido la conserva;
+         si está en blanco o sin código, la descarta.
+    5. Agrupa páginas por código y gestiona incidencias (1-N, copia DC-0022).
+    6. Guarda en destino, archiva original y replica en Oficina Técnica.
     """
     created_files = []
 
@@ -824,6 +771,8 @@ def process_scanned_pdf(
     header_pct = int(cfg.get("ocr_header_height_percent", 30))
     footer_pct = int(cfg.get("ocr_footer_height_percent", 15))
     ocr_lang = cfg.get("ocr_lang", "es-ES")
+    ocr_enabled = cfg.get("ocr_enabled", True)
+    duplex_mode = cfg.get("duplex_mode", True)
     dest_base = cfg.get("destination_base_folder") or cfg.get("escaneos_folder")
 
     if catalog is None:
@@ -832,8 +781,7 @@ def process_scanned_pdf(
     fname = os.path.basename(pdf_path)
     log(f"Iniciando procesamiento de archivo escaneado: '{fname}'...")
 
-    # 1. Comprobar que el archivo existe y es legible
-    if not os.path.exists(pdf_path):
+    if not os.path.exists(to_windows_long_path(pdf_path)):
         return {"success": False, "error": f"El archivo no existe: {pdf_path}"}
 
     try:
@@ -850,14 +798,16 @@ def process_scanned_pdf(
     log(f"Documento cargado correctamente con {total_pages} páginas.")
     notify_prog("Leyendo cabecera (pág 1) para detectar OF...", 0, total_pages)
 
-    # 2. OCR de la Cabecera de la Página 1 para detectar la OF
+    if not ocr_enabled:
+        log("⚠️ Reconocimiento OCR desactivado en configuración.", "warning")
+
+    # 1. OCR de la Cabecera de la Página 1 para detectar la OF
     log(f"🔍 Leyendo cabecera (primeros {header_pct}%) de la página 1...")
     of_res = extract_of_from_header(src_doc, page_index=0, header_height_percent=header_pct, lang=ocr_lang)
 
     detected_ofs = of_res.get("detected_ofs", [])
     best_of = of_res.get("best_of")
 
-    # Si la página 1 no tuviera la OF y hay más páginas (ej. escaneo dúplex con primera cara invertida), probar pág 2
     if not best_of and total_pages > 1:
         log("  ℹ️ No se detectó OF en página 1, probando cabecera de página 2...")
         of_res = extract_of_from_header(src_doc, page_index=1, header_height_percent=header_pct, lang=ocr_lang)
@@ -878,7 +828,7 @@ def process_scanned_pdf(
     log(f"✅ OF detectada en cabecera: '{best_of}'", "success")
     notify_prog(f"OF: {best_of}. Consultando pedidos en Aktis...", 1, total_pages, of_val=best_of)
 
-    # 3. Buscar la OF en el Excel de Aktis
+    # 2. Buscar la OF en el Excel de Aktis
     order_info = None
     for cand in detected_ofs:
         order_info = excel_manager.find_by_of(cand)
@@ -896,11 +846,9 @@ def process_scanned_pdf(
         sb_val = order_info.get("sb", "")
         is_mcd = bool("MCD" in raw_desc.upper() or "MCDONALD" in raw_client.upper() or "MC DONALD" in raw_client.upper())
 
-        # Formato de la OF para el nombre de archivo con guiones bajos (ej: MES_MO_05266, AYC_MO_00524)
         of_formatted = format_of_for_filename(of_str)
         col_h = of_formatted
 
-        # Odoo para el nombre de archivo: en McDonald's tomar macro Odoo (ej: M03376) si existe en Columna G
         m_macro = re.search(r'[A-Z]\d{5}', sb_val)
         if is_mcd and m_macro:
             col_e = m_macro.group(0)
@@ -930,7 +878,7 @@ def process_scanned_pdf(
             "sb": ""
         }
 
-    # 4. Carpeta de destino de la OF
+    # 3. Carpeta de destino de la OF
     dest_dir = os.path.join(dest_base, col_h)
     try:
         os.makedirs(to_windows_long_path(dest_dir), exist_ok=True)
@@ -941,7 +889,7 @@ def process_scanned_pdf(
 
     log(f"Carpeta destino preparada: '{dest_dir}'")
 
-    # 5. Análisis del pie de página de cada hoja del PDF (con detección automática de orientación y páginas apaisadas)
+    # 4. Análisis del pie de página de cada hoja del PDF
     log(f"🔍 Analizando pies de página de las {total_pages} páginas según 'codigosOCR.xlsx'...")
     page_classifications = []
     page_rotations = {}
@@ -969,77 +917,18 @@ def process_scanned_pdf(
             "rotation_needed": rot_needed
         })
 
-    # 6. Agrupación por tipo de documento con soporte DÚPLEX (doble cara):
-    # - Si la hoja física tiene código DC-0034 o DC-0035 (Pruebas FAT), se MANTIENEN AMBAS CARAS (anverso y reverso).
-    # - Para el resto de códigos, la cara en blanco (reverso dúplex) se ELIMINA automáticamente.
+    # 5. Agrupación por tipo de documento con soporte DÚPLEX Seguro
     DUPLEX_PRESERVE_CODES = ("DC-0034", "DC-0035")
     groups = {}
     unrecognized_pages = []
 
-    s = 0
-    while s * 2 < total_pages:
-        p_front = s * 2
-        p_back = p_front + 1 if p_front + 1 < total_pages else None
-
-        item_f = page_classifications[p_front]
-        item_b = page_classifications[p_back] if p_back is not None else None
-
-        code_f = (item_f.get("code") or "").strip().upper()
-        code_b = (item_b.get("code") or "").strip().upper() if item_b else ""
-
-        # ¿Esta hoja física corresponde a Pruebas FAT (DC-0034 / DC-0035)?
-        is_fat_sheet = (code_f in DUPLEX_PRESERVE_CODES) or (code_b in DUPLEX_PRESERVE_CODES)
-
-        if is_fat_sheet:
-            fat_code = code_f if code_f in DUPLEX_PRESERVE_CODES else code_b
-            fat_doc_def = item_f.get("doc_def") if code_f in DUPLEX_PRESERVE_CODES else (item_b.get("doc_def") if item_b else None)
-            if not fat_doc_def:
-                for d in catalog:
-                    if d.get("codigo", "").strip().upper() == fat_code:
-                        fat_doc_def = d
-                        break
-
-            doc_name = fat_doc_def.get("documento", fat_code) if fat_doc_def else fat_code
-
-            if fat_code not in groups:
-                groups[fat_code] = {
-                    "doc_def": fat_doc_def or {"codigo": fat_code, "documento": doc_name},
-                    "pages": []
-                }
-
-            rot_f = page_rotations.get(p_front, 0)
-            rot_tag_f = f" [Apaisado corregido {rot_f}°]" if rot_f else ""
-            log(f"  Pág {p_front + 1}/{total_pages}: Código '{fat_code}' -> '{doc_name}' (Anverso FAT){rot_tag_f}")
-            notify_prog(f"Pág {p_front + 1}/{total_pages}: {fat_code} (Anverso)", p_front + 1, total_pages, of_val=of_str)
-            groups[fat_code]["pages"].append(p_front)
-
-            if p_back is not None:
-                rot_b = page_rotations.get(p_back, 0)
-                rot_tag_b = f" [Apaisado corregido {rot_b}°]" if rot_b else ""
-                log(f"  Pág {p_back + 1}/{total_pages}: Doble cara mantenida para '{fat_code}' (Reverso FAT){rot_tag_b}")
-                notify_prog(f"Pág {p_back + 1}/{total_pages}: {fat_code} (Reverso)", p_back + 1, total_pages, of_val=of_str)
-                groups[fat_code]["pages"].append(p_back)
-
-        else:
-            # Documento normal: por descarte se elimina la segunda cara (reverso) de la hoja física
-            # Solo se mantiene p_front (o p_back si la hoja se introdujo al revés y el código está en el reverso)
-            if not code_f and code_b and is_page_blank(src_doc, page_index=p_front):
-                target_item = item_b
-                discard_idx = p_front
-            else:
-                target_item = item_f
-                discard_idx = p_back
-
-            if discard_idx is not None:
-                log(f"  Pág {discard_idx + 1}/{total_pages}: Segunda cara descartada por descarte (dúplex).")
-                notify_prog(f"Pág {discard_idx + 1}/{total_pages}: Segunda cara (descartada)", discard_idx + 1, total_pages, of_val=of_str)
-
-            p_idx = target_item["page_idx"]
-            doc_def = target_item["doc_def"]
-            code = (target_item.get("code") or "").strip().upper()
-            rot_needed = target_item.get("rotation_needed", 0)
-
-            # Comprobar si la cara activa está en blanco (ej. hoja blanca accidental)
+    if not duplex_mode:
+        # Modo 1 CARA: Cada página es independiente, no se descarta ningún reverso
+        for item in page_classifications:
+            p_idx = item["page_idx"]
+            doc_def = item["doc_def"]
+            code = (item.get("code") or "").strip().upper()
+            rot_needed = item.get("rotation_needed", 0)
             is_blank = (code == "BLANK") or is_page_blank(src_doc, page_index=p_idx)
 
             if is_blank:
@@ -1052,19 +941,116 @@ def process_scanned_pdf(
                 notify_prog(f"Pág {p_idx + 1}/{total_pages}: {code} ({doc_name}){rot_tag}", p_idx + 1, total_pages, of_val=of_str)
 
                 if code not in groups:
-                    groups[code] = {
-                        "doc_def": doc_def,
-                        "pages": []
-                    }
+                    groups[code] = {"doc_def": doc_def, "pages": []}
                 groups[code]["pages"].append(p_idx)
             else:
                 log(f"  Pág {p_idx + 1}/{total_pages}: ⚠️ Sin código reconocido.", "warning")
                 notify_prog(f"Pág {p_idx + 1}/{total_pages}: Sin código reconocido", p_idx + 1, total_pages, of_val=of_str)
                 unrecognized_pages.append(p_idx)
+    else:
+        # Modo DÚPLEX: Procesa por parejas de anverso y reverso
+        s = 0
+        while s * 2 < total_pages:
+            p_front = s * 2
+            p_back = p_front + 1 if p_front + 1 < total_pages else None
 
-        s += 1
+            item_f = page_classifications[p_front]
+            item_b = page_classifications[p_back] if p_back is not None else None
 
-    # 7. Generación de los archivos PDF divididos
+            code_f = (item_f.get("code") or "").strip().upper()
+            code_b = (item_b.get("code") or "").strip().upper() if item_b else ""
+
+            is_fat_sheet = (code_f in DUPLEX_PRESERVE_CODES) or (code_b in DUPLEX_PRESERVE_CODES)
+
+            if is_fat_sheet:
+                fat_code = code_f if code_f in DUPLEX_PRESERVE_CODES else code_b
+                fat_doc_def = item_f.get("doc_def") if code_f in DUPLEX_PRESERVE_CODES else (item_b.get("doc_def") if item_b else None)
+                if not fat_doc_def:
+                    for d in catalog:
+                        if d.get("codigo", "").strip().upper() == fat_code:
+                            fat_doc_def = d
+                            break
+
+                doc_name = fat_doc_def.get("documento", fat_code) if fat_doc_def else fat_code
+
+                if fat_code not in groups:
+                    groups[fat_code] = {
+                        "doc_def": fat_doc_def or {"codigo": fat_code, "documento": doc_name},
+                        "pages": []
+                    }
+
+                rot_f = page_rotations.get(p_front, 0)
+                rot_tag_f = f" [Apaisado corregido {rot_f}°]" if rot_f else ""
+                log(f"  Pág {p_front + 1}/{total_pages}: Código '{fat_code}' -> '{doc_name}' (Anverso FAT){rot_tag_f}")
+                notify_prog(f"Pág {p_front + 1}/{total_pages}: {fat_code} (Anverso)", p_front + 1, total_pages, of_val=of_str)
+                groups[fat_code]["pages"].append(p_front)
+
+                if p_back is not None:
+                    rot_b = page_rotations.get(p_back, 0)
+                    rot_tag_b = f" [Apaisado corregido {rot_b}°]" if rot_b else ""
+                    log(f"  Pág {p_back + 1}/{total_pages}: Doble cara mantenida para '{fat_code}' (Reverso FAT){rot_tag_b}")
+                    notify_prog(f"Pág {p_back + 1}/{total_pages}: {fat_code} (Reverso)", p_back + 1, total_pages, of_val=of_str)
+                    groups[fat_code]["pages"].append(p_back)
+
+            else:
+                # Comprobar si el reverso tiene su propio código válido independiente (no es un descarte)
+                b_is_distinct_doc = (code_b and code_b != "BLANK" and item_b.get("doc_def") is not None)
+                f_is_distinct_doc = (code_f and code_f != "BLANK" and item_f.get("doc_def") is not None)
+
+                if f_is_distinct_doc and b_is_distinct_doc:
+                    # Ambas caras contienen documentos reconocidos independientes: conservar ambos
+                    for target_item, code_val in [(item_f, code_f), (item_b, code_b)]:
+                        p_idx = target_item["page_idx"]
+                        doc_def = target_item["doc_def"]
+                        rot_needed = target_item.get("rotation_needed", 0)
+                        doc_name = doc_def.get("documento", code_val)
+                        rot_tag = f" [Apaisado corregido {rot_needed}°]" if rot_needed else ""
+                        log(f"  Pág {p_idx + 1}/{total_pages}: Código '{code_val}' -> '{doc_name}' (Cara independiente){rot_tag}")
+                        notify_prog(f"Pág {p_idx + 1}/{total_pages}: {code_val} ({doc_name}){rot_tag}", p_idx + 1, total_pages, of_val=of_str)
+
+                        if code_val not in groups:
+                            groups[code_val] = {"doc_def": doc_def, "pages": []}
+                        groups[code_val]["pages"].append(p_idx)
+                else:
+                    # Documento normal dúplex con reverso descartable
+                    if not code_f and code_b and is_page_blank(src_doc, page_index=p_front):
+                        target_item = item_b
+                        discard_idx = p_front
+                    else:
+                        target_item = item_f
+                        discard_idx = p_back
+
+                    if discard_idx is not None:
+                        log(f"  Pág {discard_idx + 1}/{total_pages}: Segunda cara descartada por descarte (dúplex).")
+                        notify_prog(f"Pág {discard_idx + 1}/{total_pages}: Segunda cara (descartada)", discard_idx + 1, total_pages, of_val=of_str)
+
+                    p_idx = target_item["page_idx"]
+                    doc_def = target_item["doc_def"]
+                    code = (target_item.get("code") or "").strip().upper()
+                    rot_needed = target_item.get("rotation_needed", 0)
+
+                    is_blank = (code == "BLANK") or is_page_blank(src_doc, page_index=p_idx)
+
+                    if is_blank:
+                        log(f"  Pág {p_idx + 1}/{total_pages}: Hoja en blanco descartada.")
+                        notify_prog(f"Pág {p_idx + 1}/{total_pages}: Hoja en blanco (descartada)", p_idx + 1, total_pages, of_val=of_str)
+                    elif doc_def and code and code != "BLANK":
+                        doc_name = doc_def.get("documento", code)
+                        rot_tag = f" [Apaisado corregido {rot_needed}°]" if rot_needed else ""
+                        log(f"  Pág {p_idx + 1}/{total_pages}: Código '{code}' -> '{doc_name}'{rot_tag}")
+                        notify_prog(f"Pág {p_idx + 1}/{total_pages}: {code} ({doc_name}){rot_tag}", p_idx + 1, total_pages, of_val=of_str)
+
+                        if code not in groups:
+                            groups[code] = {"doc_def": doc_def, "pages": []}
+                        groups[code]["pages"].append(p_idx)
+                    else:
+                        log(f"  Pág {p_idx + 1}/{total_pages}: ⚠️ Sin código reconocido.", "warning")
+                        notify_prog(f"Pág {p_idx + 1}/{total_pages}: Sin código reconocido", p_idx + 1, total_pages, of_val=of_str)
+                        unrecognized_pages.append(p_idx)
+
+            s += 1
+
+    # 6. Generación de los archivos PDF divididos
     escaneos_root = cfg.get("escaneos_folder") or dest_base
     inc_folder = os.path.join(escaneos_root, "incidencias")
     if not os.path.isdir(inc_folder) and os.path.isdir(os.path.join(escaneos_root, "Incidencias")):
@@ -1077,11 +1063,9 @@ def process_scanned_pdf(
         doc_name = get_short_document_name(code, default_doc_name, is_mcd=is_mcd)
         is_inc = doc_def.get("is_incidencia", False) or (str(code).upper() in ("DC-0020", "DC-0022"))
 
-        # Regla especial Incidencias: si hay más de 1 página, hacer varios PDFs independientes (1-3, 2-3, 3-3)
         if is_inc and len(pages) > 1:
             total_inc = len(pages)
             for k, p in enumerate(pages, start=1):
-                # Nomenclatura elegida: 1-3
                 parts = [doc_name, f"{k}-{total_inc}"]
                 if col_e:
                     parts.append(col_e)
@@ -1091,8 +1075,7 @@ def process_scanned_pdf(
                 out_name = " - ".join(parts) + ".pdf"
                 out_path = os.path.join(dest_dir, out_name)
 
-                # Si ya existiese, evitar sobreescritura accidental
-                if os.path.exists(out_path):
+                if os.path.exists(to_windows_long_path(out_path)):
                     base, ext = os.path.splitext(out_name)
                     out_path = os.path.join(dest_dir, f"{base}_{int(time.time())}{ext}")
 
@@ -1104,7 +1087,6 @@ def process_scanned_pdf(
                 sub_doc.save(to_windows_long_path(out_path))
                 sub_doc.close()
 
-                # Duplicar copia en la carpeta general de incidencias sólo para DC-0022 (las DC-0020 no)
                 if str(code).strip().upper() == "DC-0022":
                     try:
                         os.makedirs(to_windows_long_path(inc_folder), exist_ok=True)
@@ -1125,7 +1107,6 @@ def process_scanned_pdf(
                 log(f"  📄 Creado: '{os.path.basename(out_path)}' (Pág {p + 1})")
                 notify_prog(f"Generado: {os.path.basename(out_path)}", total_pages, total_pages, of_val=of_str)
         else:
-            # Documento normal: agrupar todas las páginas en un único PDF
             parts = [doc_name]
             if col_e:
                 parts.append(col_e)
@@ -1135,7 +1116,7 @@ def process_scanned_pdf(
             out_name = " - ".join(parts) + ".pdf"
             out_path = os.path.join(dest_dir, out_name)
 
-            if os.path.exists(out_path):
+            if os.path.exists(to_windows_long_path(out_path)):
                 base, ext = os.path.splitext(out_name)
                 out_path = os.path.join(dest_dir, f"{base}_{int(time.time())}{ext}")
 
@@ -1148,7 +1129,6 @@ def process_scanned_pdf(
             sub_doc.save(to_windows_long_path(out_path))
             sub_doc.close()
 
-            # Duplicar copia en la carpeta general de incidencias sólo para DC-0022 (las DC-0020 no)
             if str(code).strip().upper() == "DC-0022":
                 try:
                     os.makedirs(to_windows_long_path(inc_folder), exist_ok=True)
@@ -1170,15 +1150,13 @@ def process_scanned_pdf(
             log(f"  📄 Creado: '{os.path.basename(out_path)}' ({len(pages)} págs: {pages_human})")
             notify_prog(f"Generado: {os.path.basename(out_path)}", total_pages, total_pages, of_val=of_str)
 
-    # Páginas no reconocidas
+    # 7. Páginas no reconocidas
     alert_unrecognized = None
     if unrecognized_pages:
         unrec_pages_human = [p + 1 for p in unrecognized_pages]
         unrec_name = f"REVISAR_PAGINAS_NO_IDENTIFICADAS - {col_h}.pdf"
         unrec_path = os.path.join(dest_dir, unrec_name)
 
-        if os.path.exists(out_path if 'out_path' in locals() else unrec_path):
-            pass
         if os.path.exists(to_windows_long_path(unrec_path)):
             base, ext = os.path.splitext(unrec_name)
             unrec_path = os.path.join(dest_dir, f"{base}_{int(time.time())}{ext}")
@@ -1233,7 +1211,14 @@ def process_scanned_pdf(
         log_callback=log
     )
 
-    full_alert = alert_unrecognized or alert_warning
+    # Combinar alertas de forma segura sin perder ninguna
+    alerts_list = []
+    if alert_warning:
+        alerts_list.append(alert_warning)
+    if alert_unrecognized:
+        alerts_list.append(alert_unrecognized)
+    full_alert = "\n\n".join(alerts_list) if alerts_list else None
+
     log(f"🎉 Lote de la OF '{of_str}' completado con éxito. Generados {len(created_files)} archivos PDF.", "success")
 
     return {
@@ -1241,6 +1226,7 @@ def process_scanned_pdf(
         "of": of_str,
         "order_info": order_info,
         "destination_dir": dest_dir,
+        "dest_dir": dest_dir,  # Compatibilidad total entre interfaces
         "total_pages": total_pages,
         "created_files": created_files,
         "unrecognized_pages": [p + 1 for p in unrecognized_pages],
@@ -1253,18 +1239,21 @@ def process_scanned_pdf(
 class ScanningSession:
     """
     Gestor de escucha automática continua para la carpeta de escaneos.
-    Monitoriza la llegada de nuevos PDFs por lotes, los procesa automáticamente
-    y mantiene el historial de lotes y las alertas vivas para la interfaz.
+    Soporta cola protegida contra concurrencia, IDs monotónicos para eventos y lotes,
+    recarga dinámica de códigos y gestión de alertas múltiples.
     """
-    def __init__(self, excel_manager: ExcelManager):
+    def __init__(self, excel_manager: Optional[ExcelManager] = None):
         self.excel_manager = excel_manager
         self.active = False
         self.worker_thread = None
         self.stop_event = threading.Event()
         self.lock = threading.RLock()
+        self.processing_lock = threading.Lock()
         
         self.events_log = []
+        self._next_event_id = 1
         self.batches_history = []
+        self._next_batch_id = 1
         self.active_alerts = []
         self.current_processing_file = None
         self.current_progress = {
@@ -1277,7 +1266,7 @@ class ScanningSession:
             "created_files": []
         }
         self.last_batch = None
-        self.processed_files_set = set()
+        self.processed_files_set = set()  # set of (path, mtime, size)
 
     def update_progress(self, is_processing: bool, filename: str = "", of: str = "", phase: str = "", current_page: int = 0, total_pages: int = 0, created_files: list = None):
         with self.lock:
@@ -1293,17 +1282,23 @@ class ScanningSession:
 
     def log(self, message: str, level: str = "info"):
         timestamp = datetime.now().strftime("%H:%M:%S")
-        entry = {"time": timestamp, "message": message, "level": level}
         with self.lock:
+            entry = {
+                "id": self._next_event_id,
+                "time": timestamp,
+                "message": message,
+                "level": level
+            }
+            self._next_event_id += 1
             self.events_log.append(entry)
-            if len(self.events_log) > 100:
+            if len(self.events_log) > 200:
                 self.events_log.pop(0)
         print(f"[{timestamp}] [{level.upper()}] {message}")
 
     def add_alert(self, title: str, message: str, level: str = "warning", dest_dir: str = ""):
         timestamp = datetime.now().strftime("%H:%M:%S")
         alert = {
-            "id": int(time.time() * 1000),
+            "id": int(time.time() * 1000) + len(self.active_alerts),
             "time": timestamp,
             "title": title,
             "message": message,
@@ -1320,6 +1315,78 @@ class ScanningSession:
     def clear_alerts(self):
         with self.lock:
             self.active_alerts.clear()
+
+    def process_file(self, pdf_path: str, progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None) -> Dict[str, Any]:
+        """Procesa un archivo PDF de forma atómica y segura evitando colisiones concurrentes."""
+        with self.processing_lock:
+            catalog = load_ocr_catalog()
+            fname = os.path.basename(pdf_path)
+            self.current_processing_file = fname
+            self.update_progress(
+                is_processing=True,
+                filename=fname,
+                phase="Iniciando análisis...",
+                current_page=0,
+                total_pages=0,
+                created_files=[]
+            )
+
+            def _on_prog(pdata):
+                self.update_progress(
+                    is_processing=True,
+                    filename=fname,
+                    of=pdata.get("of", ""),
+                    phase=pdata.get("phase", ""),
+                    current_page=pdata.get("current_page", 0),
+                    total_pages=pdata.get("total_pages", 0),
+                    created_files=pdata.get("created_files", [])
+                )
+                if progress_callback:
+                    try:
+                        progress_callback(pdata)
+                    except Exception:
+                        pass
+
+            try:
+                res = process_scanned_pdf(
+                    pdf_path=pdf_path,
+                    excel_manager=self.excel_manager,
+                    catalog=catalog,
+                    log_callback=self.log,
+                    progress_callback=_on_prog
+                )
+            finally:
+                self.update_progress(is_processing=False)
+                self.current_processing_file = None
+
+            if res.get("success"):
+                with self.lock:
+                    self.last_batch = res
+                    batch_entry = {
+                        "id": self._next_batch_id,
+                        "time": datetime.now().strftime("%H:%M:%S"),
+                        "of": res["of"],
+                        "order_info": res["order_info"],
+                        "dest_dir": res["destination_dir"],
+                        "destination_dir": res["destination_dir"],
+                        "total_pages": res["total_pages"],
+                        "files_count": len(res["created_files"]),
+                        "created_files": res["created_files"],
+                        "alert": res.get("alert"),
+                        "ot_replica_path": res.get("ot_replica_path"),
+                        "archive_path": res.get("archive_path")
+                    }
+                    self._next_batch_id += 1
+                    self.batches_history.append(batch_entry)
+
+                if res.get("alert"):
+                    self.add_alert(
+                        title=f"Aviso en OF {res['of']}",
+                        message=res["alert"],
+                        level="warning",
+                        dest_dir=res["destination_dir"]
+                    )
+            return res
 
     def start_listening(self) -> Tuple[bool, str]:
         with self.lock:
@@ -1355,15 +1422,15 @@ class ScanningSession:
                 "current_processing_file": self.current_processing_file,
                 "current_progress": dict(self.current_progress),
                 "last_batch": self.last_batch,
-                "batches_history": self.batches_history[-20:], # Últimos 20 lotes
+                "batches_history": list(self.batches_history[-50:]),
                 "active_alerts": list(self.active_alerts),
-                "events_log": list(self.events_log[-35:]),
-                "total_batches_processed": len(self.batches_history)
+                "events_log": list(self.events_log[-50:]),
+                "total_batches_processed": len(self.batches_history),
+                "last_event_id": self._next_event_id - 1,
+                "last_batch_id": self._next_batch_id - 1
             }
 
     def _monitor_loop(self):
-        catalog = load_ocr_catalog()
-
         while not self.stop_event.is_set():
             try:
                 cfg = load_config()
@@ -1374,104 +1441,55 @@ class ScanningSession:
                     continue
 
                 candidates = []
+                current_files = set()
+
                 with os.scandir(escaneos_folder) as entries:
                     for entry in entries:
                         if entry.is_file() and entry.name.lower().endswith(".pdf"):
-                            # Ignorar archivos que empiecen por '_' (originales o temporales)
                             if entry.name.startswith("_"):
                                 continue
-                            if entry.path not in self.processed_files_set:
-                                try:
-                                    stat = entry.stat()
-                                    candidates.append((stat.st_mtime, entry.path, entry.name))
-                                except Exception:
-                                    pass
+                            current_files.add(entry.path)
+                            try:
+                                stat = entry.stat()
+                                sig = (entry.path, stat.st_mtime, stat.st_size)
+                                if sig not in self.processed_files_set:
+                                    candidates.append((stat.st_mtime, entry.path, entry.name, sig))
+                            except Exception:
+                                pass
 
-                # Procesar por orden cronológico (el más antiguo primero)
+                # Limpieza de archivos que ya no existen en bandeja
+                self.processed_files_set = {sig for sig in self.processed_files_set if sig[0] in current_files}
+
                 candidates.sort(key=lambda x: x[0])
 
-                for mtime, fpath, fname in candidates:
+                for mtime, fpath, fname, sig in candidates:
                     if self.stop_event.is_set():
                         break
 
                     if not is_file_ready(fpath):
-                        # Todavía está siendo escrito por el escáner
                         continue
 
-                    self.current_processing_file = fname
-                    self.update_progress(
-                        is_processing=True,
-                        filename=fname,
-                        phase="Nuevo escaneo detectado. Preparando análisis...",
-                        current_page=0,
-                        total_pages=0,
-                        created_files=[]
-                    )
                     self.log(f"📥 Nuevo PDF detectado en bandeja: '{fname}'. Procesando lote...")
+                    batch_res = self.process_file(fpath)
+                    self.processed_files_set.add(sig)
 
-                    def _on_prog(pdata):
-                        self.update_progress(
-                            is_processing=True,
-                            filename=fname,
-                            of=pdata.get("of", ""),
-                            phase=pdata.get("phase", ""),
-                            current_page=pdata.get("current_page", 0),
-                            total_pages=pdata.get("total_pages", 0),
-                            created_files=pdata.get("created_files", [])
-                        )
-
-                    batch_res = process_scanned_pdf(
-                        pdf_path=fpath,
-                        excel_manager=self.excel_manager,
-                        catalog=catalog,
-                        log_callback=self.log,
-                        progress_callback=_on_prog
-                    )
-
-                    self.update_progress(is_processing=False)
-                    self.processed_files_set.add(fpath)
-                    self.current_processing_file = None
-
-                    if batch_res["success"]:
-                        self.last_batch = batch_res
-                        batch_entry = {
-                            "time": datetime.now().strftime("%H:%M:%S"),
-                            "of": batch_res["of"],
-                            "order_info": batch_res["order_info"],
-                            "dest_dir": batch_res["destination_dir"],
-                            "total_pages": batch_res["total_pages"],
-                            "files_count": len(batch_res["created_files"]),
-                            "created_files": batch_res["created_files"],
-                            "alert": batch_res["alert"]
-                        }
-                        self.batches_history.append(batch_entry)
-
-                        if batch_res.get("alert"):
-                            self.add_alert(
-                                title=f"Aviso en OF {batch_res['of']}",
-                                message=batch_res["alert"],
-                                level="warning",
-                                dest_dir=batch_res["destination_dir"]
-                            )
-
-                        # Sonido de confirmación en Windows
+                    if batch_res.get("success"):
                         try:
                             import winsound
                             winsound.MessageBeep(winsound.MB_ICONASTERISK)
                         except Exception:
                             pass
                     else:
-                        # Error procesando (ej: no se detectó OF)
                         err_msg = batch_res.get("error", "Error desconocido")
                         unrec_dir = os.path.join(escaneos_folder, "_NO_IDENTIFICADOS")
                         dest_err = ""
                         try:
-                            os.makedirs(unrec_dir, exist_ok=True)
+                            os.makedirs(to_windows_long_path(unrec_dir), exist_ok=True)
                             dest_err = os.path.join(unrec_dir, fname)
-                            if os.path.exists(dest_err):
+                            if os.path.exists(to_windows_long_path(dest_err)):
                                 base_e, ext_e = os.path.splitext(fname)
                                 dest_err = os.path.join(unrec_dir, f"{base_e}_{int(time.time())}{ext_e}")
-                            shutil.move(fpath, dest_err)
+                            shutil.move(to_windows_long_path(fpath), to_windows_long_path(dest_err))
                             self.log(f"📁 Archivo sin OF movido a '_NO_IDENTIFICADOS/{os.path.basename(dest_err)}' para revisión.", "warning")
                         except Exception as e_mv_err:
                             dest_err = ""
